@@ -43,9 +43,10 @@ class RibbonToolBar(QWidget):
 
     import_clicked = pyqtSignal()
     reset_view_clicked = pyqtSignal()
+    redefine_world_clicked = pyqtSignal()
     export_clicked = pyqtSignal()
     clear_clicked = pyqtSignal()
-    redefine_world_clicked = pyqtSignal()
+    material_clicked = pyqtSignal()
     theme_toggled = pyqtSignal()
     help_clicked = pyqtSignal()
 
@@ -68,6 +69,7 @@ class RibbonToolBar(QWidget):
             ("🎯", "Reset View", self.reset_view_clicked),
             ("📐", "Redefine World", self.redefine_world_clicked),
             ("💾", "Export GDML", self.export_clicked),
+            ("🧪", "Material", self.material_clicked),
             ("🗑️", "Clear All", self.clear_clicked),
         ]
 

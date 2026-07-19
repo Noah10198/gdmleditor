@@ -23,12 +23,15 @@ from PyQt6.QtGui import QAction, QPalette, QColor, QFont
 
 from core.gdml_agent import GdmlAgent
 from core.gdml_tree import GdmlNode, GdmlNodeType
+from core.materials_lib import MaterialsLib
 from utils.logger import AsyncLogger, LogLevel
 from ui.ribbon_toolbar import RibbonToolBar
 from ui.project_tree import ProjectTreeWidget
 from ui.property_panel import PropertyPanel
 from ui.vtk_widget import VtkWidget
 from ui.redefine_world_dialog import RedefineWorldDialog
+from ui.assign_material_dialog import AssignMaterialDialog
+from ui.local_material_dialog import LocalMaterialDialog
 
 
 class MainWindow(QMainWindow):
@@ -41,6 +44,7 @@ class MainWindow(QMainWindow):
 
         self._gdml_agent = GdmlAgent()
         self._logger = AsyncLogger()
+        self._mat_lib = MaterialsLib()
 
         self._vtk_widget: Optional[VtkWidget] = None
 
@@ -54,12 +58,49 @@ class MainWindow(QMainWindow):
         self._init_layout()
         self._init_status_bar()
 
+        # Initialize material library (after all widgets created)
+        self._init_material_library()
+
         # Apply theme (after all widgets created)
         self._apply_global_theme(True)
 
         self._connect_signals()
 
         self._logger.log_system("GDML Editor started")
+
+    # ==================== Material Library ====================
+
+    def _init_material_library(self):
+        """初始化材料库：加载元素周期表 + NIST 材料。"""
+        data_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+        )
+        elem_path = os.path.join(data_dir, "element.xml")
+        nist_path = os.path.join(data_dir, "nist.txt")
+
+        if os.path.exists(elem_path):
+            cnt = MaterialsLib.load_elements_from_xml(elem_path)
+            self._logger.log_system(f"Loaded {cnt} elements from element.xml")
+        else:
+            self._logger.log_system(f"element.xml not found at {elem_path}",
+                                    LogLevel.WARNING)
+
+        if os.path.exists(nist_path):
+            cnt = self._mat_lib.load_nist_from_file(nist_path)
+            self._logger.log_system(f"Loaded {cnt} NIST materials from nist.txt")
+        else:
+            self._logger.log_system(f"nist.txt not found at {nist_path}",
+                                    LogLevel.WARNING)
+
+        # 加载本地材料 JSON（如果有的话）
+        json_path = os.path.join(data_dir, "local_materials.json")
+        if os.path.exists(json_path):
+            cnt = self._mat_lib.load_local_materials_from_json(json_path)
+            self._logger.log_system(f"Loaded {cnt} local materials from JSON")
+
+        # 将材料库挂到项目树上
+        self._project_tree.set_material_lib(self._mat_lib)
+        self._project_tree.refresh_materials()
 
     # ==================== Theme ====================
 
@@ -161,11 +202,12 @@ class MainWindow(QMainWindow):
         self._project_tree = ProjectTreeWidget()
         self._tree_dock = QDockWidget("Project Tree", self)
         self._tree_dock.setWidget(self._project_tree)
-        self._tree_dock.setMinimumWidth(200)
+        self._tree_dock.setMinimumWidth(280)
         self._tree_dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable |
             QDockWidget.DockWidgetFeature.DockWidgetFloatable)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
+        self.resizeDocks([self._tree_dock], [280], Qt.Orientation.Horizontal)
 
     def _init_center_placeholder(self):
         """Initialize placeholder label for center area."""
@@ -188,11 +230,12 @@ class MainWindow(QMainWindow):
         self._property_panel = PropertyPanel()
         self._prop_dock = QDockWidget("Properties", self)
         self._prop_dock.setWidget(self._property_panel)
-        self._prop_dock.setMinimumWidth(200)
+        self._prop_dock.setMinimumWidth(280)
         self._prop_dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable |
             QDockWidget.DockWidgetFeature.DockWidgetFloatable)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._prop_dock)
+        self.resizeDocks([self._prop_dock], [280], Qt.Orientation.Horizontal)
 
     def _init_log_panel(self):
         """Initialize log panel (bottom)"""
@@ -235,12 +278,21 @@ class MainWindow(QMainWindow):
         self._toolbar.export_clicked.connect(self._on_export_gdml)
         self._toolbar.clear_clicked.connect(self._on_clear_all)
         self._toolbar.redefine_world_clicked.connect(self._on_redefine_world)
+        self._toolbar.material_clicked.connect(self._on_material_assignment)
         self._toolbar.theme_toggled.connect(self._toggle_theme)
         self._toolbar.help_clicked.connect(self._on_help)
 
         # Project tree
         self._project_tree.node_selected.connect(self._on_node_selected)
         self._project_tree.visibility_changed.connect(self._on_visibility_changed)
+        self._project_tree.add_local_material_requested.connect(
+            self._on_add_local_material)
+        self._project_tree.remove_local_material_requested.connect(
+            self._on_remove_local_material)
+        self._project_tree.save_local_materials_requested.connect(
+            self._on_save_local_materials)
+        self._project_tree.load_local_materials_requested.connect(
+            self._on_load_local_materials)
 
         # NOTE: VTK picking signal is connected lazily when _get_vtk_window() is called.
 
@@ -357,8 +409,109 @@ class MainWindow(QMainWindow):
             "Built with PyQt6 and VTK.\n\n"
             "Part of Easy2Rad project.")
 
+    # ==================== Material handlers ====================
+
+    def _on_material_assignment(self):
+        """打开批量材料分配对话框。"""
+        file_nodes = self._gdml_agent.get_all_file_nodes()
+        if not file_nodes:
+            QMessageBox.information(
+                self, "Assign Materials",
+                "No GDML files loaded.\nImport a GDML file first.")
+            return
+
+        dialog = AssignMaterialDialog(self._gdml_agent, self._mat_lib, self)
+        dialog.materials_saved.connect(self._on_materials_saved)
+        dialog.exec()
+
+    def _on_materials_saved(self, assigned: int, total: int):
+        """材料分配保存后重建 3D 场景（更新颜色）。"""
+        self._logger.log_system(
+            f"Materials assigned: {assigned}/{total} volumes have materials")
+        # 刷新 3D 场景（材料颜色变更）
+        root = self._gdml_agent.get_root_node()
+        if self._vtk_widget:
+            self._vtk_widget.build_scene(root)
+        self._status_label.setText(
+            f"Materials: {assigned}/{total} assigned")
+
+    def _on_add_local_material(self):
+        """打开添加局部材料对话框。"""
+        dialog = LocalMaterialDialog(self._mat_lib, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._project_tree.populate_local_materials(self._mat_lib)
+            self._logger.log_system(
+                f"Local material added. Total: "
+                f"{len(self._mat_lib.get_local_material_names())}")
+
+    def _on_remove_local_material(self, mat_name: str):
+        """删除局部材料。"""
+        # 按名称查找并删除
+        for mat in self._mat_lib.get_all_local_materials():
+            name = getattr(mat, 'mat_name', getattr(mat, 'name', ''))
+            if name == mat_name:
+                mat_id = getattr(mat, 'mat_id', '')
+                if self._mat_lib.delete_material(mat_id):
+                    self._project_tree.populate_local_materials(self._mat_lib)
+                    self._logger.log_system(f"Deleted local material: {mat_name}")
+                return
+
+    def _on_save_local_materials(self):
+        """保存局部材料到 JSON 文件。"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Local Materials", "",
+            "JSON Files (*.json);;All Files (*)")
+        if not file_path:
+            return
+        if self._mat_lib.save_local_materials_to_json(file_path):
+            self._logger.log_system(
+                f"Saved {len(self._mat_lib.get_local_material_names())} "
+                f"local materials to {file_path}")
+        else:
+            self._logger.log_system("Failed to save local materials",
+                                    LogLevel.ERROR)
+
+    def _on_load_local_materials(self):
+        """从 JSON 文件加载局部材料。"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Local Materials", "",
+            "JSON Files (*.json);;All Files (*)")
+        if not file_path:
+            return
+        cnt = self._mat_lib.load_local_materials_from_json(file_path)
+        if cnt > 0:
+            self._project_tree.populate_local_materials(self._mat_lib)
+            self._logger.log_system(
+                f"Loaded {cnt} local materials from {file_path}")
+        else:
+            self._logger.log_system(
+                "No local materials loaded (file may be empty)",
+                LogLevel.WARNING)
+
     def _on_node_selected(self, entry_id: str):
-        """Tree node selected"""
+        """Tree node selected (handles geometry + material items, matching cad2gdml)."""
+        # ── NIST material item clicked ──
+        if entry_id.startswith("__mat__:"):
+            mat_name = entry_id[8:]
+            density = self._mat_lib.get_nist_density(mat_name)
+            self._property_panel.show_material_reference(mat_name, density)
+            self._status_label.setText(f"Material: {mat_name}")
+            return
+
+        # ── Local material item clicked ──
+        if entry_id.startswith("__local__:"):
+            mat_id = entry_id[10:]
+            mat = self._get_local_material_by_id(mat_id)
+            if mat:
+                self._property_panel.show_local_material_info(mat)
+                self._status_label.setText(
+                    f"Local Material: {getattr(mat, 'mat_name', mat_id)}")
+            else:
+                self._property_panel.show_node(None)
+                self._status_label.setText(f"Local material (id={mat_id}) not found")
+            return
+
+        # ── Geometry node clicked ──
         node = self._gdml_agent.get_node_by_entry_id(entry_id)
         if node:
             self._property_panel.show_node(node)
@@ -367,6 +520,17 @@ class MainWindow(QMainWindow):
                 scene.select_node(entry_id)
                 self._vtk_widget.refresh()
             self._status_label.setText(f"Selected: {node.name}")
+        else:
+            self._property_panel.show_node(None)
+            self._status_label.setText("No node selected")
+
+    def _get_local_material_by_id(self, mat_id: str):
+        """查找局部材料 by mat_id（匹配 cad2gdml 的 _get_local_material_by_id）。"""
+        for mat in self._mat_lib.get_all_local_materials():
+            mid = getattr(mat, 'mat_id', '')
+            if mid == mat_id:
+                return mat
+        return None
 
     def _on_visibility_changed(self, entry_id: str, visible: bool):
         """Visibility changed"""

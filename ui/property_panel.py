@@ -141,6 +141,11 @@ class PropertyPanel(QWidget):
     def show_node(self, node: Optional[GdmlNode]):
         """Display node properties"""
         self._current_node = node
+        # Show all groups
+        self._info_group.setVisible(True)
+        self._solid_group.setVisible(True)
+        self._placement_group.setVisible(True)
+
         if node is None:
             self._name_label.setText("-")
             self._type_label.setText("-")
@@ -168,6 +173,52 @@ class PropertyPanel(QWidget):
 
         self._solid_group.setVisible(bool(node.solid_params))
         self._placement_group.setVisible(node.placement is not None)
+
+    def show_material_reference(self, mat_name: str, density: float = 0.0):
+        """Display NIST material reference info (matches cad2gdml's show_material_reference)."""
+        self._current_node = None
+        self._info_group.setVisible(True)
+        self._solid_group.setVisible(False)
+        self._placement_group.setVisible(False)
+
+        self._name_label.setText(mat_name)
+        self._type_label.setText("NIST Material")
+        self._entry_label.setText("-")
+        self._mat_label.setText(f"{density:.4f} g/cm³" if density else "NIST Standard")
+
+        self._clear_form(self._solid_layout)
+        self._update_placement(None)
+
+    def show_local_material_info(self, mat) -> None:
+        """Display local material info (matches cad2gdml's show_local_material_info)."""
+        self._current_node = None
+        self._info_group.setVisible(True)
+        self._solid_group.setVisible(True)
+        self._placement_group.setVisible(False)
+
+        mat_name = getattr(mat, 'mat_name', 'unnamed')
+        mat_id = getattr(mat, 'mat_id', '-')
+        density = getattr(mat, 'density', 0.0)
+
+        self._name_label.setText(mat_name)
+        self._type_label.setText("Local Material")
+        self._entry_label.setText(mat_id)
+        self._mat_label.setText(f"{density:.4f} g/cm³")
+
+        # Show components
+        self._clear_form(self._solid_layout)
+        components = getattr(mat, 'components', []) or getattr(mat, 'items', [])
+        for comp in components:
+            if hasattr(comp, 'symbol') and hasattr(comp, 'atom_count'):
+                # CompoundItem: symbol + atom_count
+                label = QLabel(f"  {comp.symbol}:")
+                value_label = QLabel(f"{comp.atom_count} atom(s)")
+                self._solid_layout.addRow(label, value_label)
+            elif hasattr(comp, 'symbol') and hasattr(comp, 'mass_fraction'):
+                # MixtureItem: symbol + mass_fraction
+                label = QLabel(f"  {comp.symbol}:")
+                value_label = QLabel(f"{comp.mass_fraction * 100:.1f}%")
+                self._solid_layout.addRow(label, value_label)
 
     def _update_placement(self, placement: Optional[Placement]):
         """Update placement display"""

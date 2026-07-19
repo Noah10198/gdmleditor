@@ -7,17 +7,19 @@ Aligns with cad2gdml's ProjectTreeWidget style:
 - Uniform text color (no per-type color coding)
 - Clean, minimal look
 - Supports checkbox visibility control and selection
+- Global/Local Materials nodes (reuse from cad2gdml)
 """
 
-from typing import Optional
+from typing import Optional, List
 
 from PyQt6.QtWidgets import (
-    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QLabel
+    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
 
 from core.gdml_tree import GdmlNode, GdmlNodeType
+from core.materials_lib import MaterialsLib
 
 
 # Custom data roles
@@ -31,8 +33,18 @@ class ProjectTreeWidget(QWidget):
     node_selected = pyqtSignal(str)       # Node selected, emits entry_id
     visibility_changed = pyqtSignal(str, bool)  # Visibility changed
 
+    # Material signals (matches cad2gdml)
+    assign_material_requested = pyqtSignal()
+    add_local_material_requested = pyqtSignal()
+    remove_local_material_requested = pyqtSignal(str)   # material name
+    save_local_materials_requested = pyqtSignal()
+    load_local_materials_requested = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._mat_lib: Optional[MaterialsLib] = None
+        self._global_mat_root: Optional[QTreeWidgetItem] = None
+        self._local_mat_root: Optional[QTreeWidgetItem] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -55,7 +67,18 @@ class ProjectTreeWidget(QWidget):
         self._tree.setAnimated(True)
         self._tree.setIndentation(16)
 
-        # Geometry root node (matches cad2gdml's "Geometry" root)
+        # Material nodes first (matches cad2gdml: Global → Local → Geometry)
+        self._global_mat_root = QTreeWidgetItem(self._tree, ["Global Materials"])
+        self._global_mat_root.setExpanded(False)  # 278 items, keep collapsed
+        self._global_mat_root.setFlags(self._global_mat_root.flags()
+                                        & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+        self._local_mat_root = QTreeWidgetItem(self._tree, ["Local Materials"])
+        self._local_mat_root.setExpanded(True)
+        self._local_mat_root.setFlags(self._local_mat_root.flags()
+                                       & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+        # Geometry root node (after materials, matching cad2gdml)
         self._geometry_root = QTreeWidgetItem(self._tree, ["Geometry"])
         self._geometry_root.setExpanded(True)
 
@@ -67,6 +90,8 @@ class ProjectTreeWidget(QWidget):
         # Connect signals
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def set_dark_theme(self, is_dark: bool):
         """Switch between dark and light appearance — matches cad2gdml's palette."""
@@ -117,6 +142,73 @@ class ProjectTreeWidget(QWidget):
                 background-color: {hover_bg};
             }}
         """)
+
+    # ==================== Material Library ====================
+
+    def set_material_lib(self, mat_lib: MaterialsLib):
+        """Set MaterialsLib reference."""
+        self._mat_lib = mat_lib
+
+    def populate_global_materials(self, mat_names: List[str]):
+        """Populate the Global Materials tree node (matches cad2gdml)."""
+        self._global_mat_root.takeChildren()
+        for name in mat_names:
+            item = QTreeWidgetItem(self._global_mat_root, [name])
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(0, Qt.ItemDataRole.UserRole, f"__mat__:{name}")
+
+    def populate_local_materials(self, mat_lib: Optional[MaterialsLib] = None):
+        """Populate the Local Materials tree node (matches cad2gdml)."""
+        lib = mat_lib or self._mat_lib
+        if lib is None:
+            return
+        self._local_mat_root.takeChildren()
+        for mat in lib.get_all_local_materials():
+            name = getattr(mat, 'mat_name',
+                           getattr(mat, 'name', 'unnamed'))
+            mat_id = getattr(mat, 'mat_id', getattr(mat, 'mat_id', ''))
+            item = QTreeWidgetItem(self._local_mat_root, [name])
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(0, Qt.ItemDataRole.UserRole, f"__local__:{mat_id}")
+
+    def refresh_materials(self):
+        """Refresh all material tree nodes from library."""
+        if self._mat_lib:
+            self.populate_global_materials(self._mat_lib.get_nist_list())
+            self.populate_local_materials(self._mat_lib)
+
+    # ==================== Context Menu ====================
+
+    def _on_context_menu(self, pos):
+        """Handle right-click context menu."""
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+
+        # Local Materials root (matches cad2gdml emoji icons)
+        if item is self._local_mat_root:
+            menu = QMenu(self)
+            add_act = menu.addAction("➕ Add Material...")
+            add_act.triggered.connect(self.add_local_material_requested.emit)
+            menu.addSeparator()
+            save_act = menu.addAction("💾 Save Materials...")
+            save_act.triggered.connect(self.save_local_materials_requested.emit)
+            load_act = menu.addAction("📂 Load Materials...")
+            load_act.triggered.connect(self.load_local_materials_requested.emit)
+            menu.exec(self._tree.viewport().mapToGlobal(pos))
+            return
+
+        # Local Material item (delete, matches cad2gdml emoji)
+        if item.parent() is self._local_mat_root:
+            menu = QMenu(self)
+            del_act = menu.addAction("❌ Delete Material")
+            action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            if action == del_act:
+                mat_name = item.text(0)
+                self.remove_local_material_requested.emit(mat_name)
+            return
+
+    # ==================== Geometry Tree ====================
 
     def clear_tree(self):
         """Clear the geometry tree (preserves root)."""
@@ -189,6 +281,13 @@ class ProjectTreeWidget(QWidget):
         if item is self._geometry_root:
             return
 
+        # Material items (matches cad2gdml: emit __mat__:xxx / __local__:xxx)
+        user_data = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if user_data.startswith("__mat__:") or user_data.startswith("__local__:"):
+            self.node_selected.emit(user_data)
+            return
+
+        # Geometry items
         entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
         if entry_id:
             self.node_selected.emit(entry_id)
