@@ -165,7 +165,16 @@ class PropertyPanel(QWidget):
         if node.solid_params:
             for key, value in node.solid_params.items():
                 label = QLabel(f"{key}:")
-                value_label = QLabel(f"{value:.4f}")
+                if isinstance(value, (int, float)):
+                    value_label = QLabel(f"{value:.4f}" if isinstance(value, float) else str(value))
+                elif isinstance(value, dict):
+                    value_label = QLabel(f"{len(value)} items")
+                elif isinstance(value, (list, tuple)):
+                    value_label = QLabel(f"{len(value)} items")
+                elif isinstance(value, str):
+                    value_label = QLabel(value)
+                else:
+                    value_label = QLabel(str(value))
                 self._solid_layout.addRow(label, value_label)
 
         # Placement
@@ -191,34 +200,65 @@ class PropertyPanel(QWidget):
 
     def show_local_material_info(self, mat) -> None:
         """Display local material info (matches cad2gdml's show_local_material_info)."""
+        from core.materials_lib import CustomElement
+
         self._current_node = None
         self._info_group.setVisible(True)
         self._solid_group.setVisible(True)
         self._placement_group.setVisible(False)
 
-        mat_name = getattr(mat, 'mat_name', 'unnamed')
+        # Custom element: display symbol as name (matches cad2gdml)
+        if isinstance(mat, CustomElement):
+            mat_name = mat.symbol
+        else:
+            mat_name = getattr(mat, 'mat_name', 'unnamed')
         mat_id = getattr(mat, 'mat_id', '-')
         density = getattr(mat, 'density', 0.0)
 
         self._name_label.setText(mat_name)
         self._type_label.setText("Local Material")
         self._entry_label.setText(mat_id)
-        self._mat_label.setText(f"{density:.4f} g/cm³")
+        self._mat_label.setText(f"{density:.4f} g/cm3")
 
         # Show components
         self._clear_form(self._solid_layout)
         components = getattr(mat, 'components', []) or getattr(mat, 'items', [])
+
+        is_mixture = False
+        total_ratio = 0.0
         for comp in components:
             if hasattr(comp, 'symbol') and hasattr(comp, 'atom_count'):
-                # CompoundItem: symbol + atom_count
                 label = QLabel(f"  {comp.symbol}:")
                 value_label = QLabel(f"{comp.atom_count} atom(s)")
                 self._solid_layout.addRow(label, value_label)
+                total_ratio += comp.atom_count
             elif hasattr(comp, 'symbol') and hasattr(comp, 'mass_fraction'):
-                # MixtureItem: symbol + mass_fraction
+                is_mixture = True
                 label = QLabel(f"  {comp.symbol}:")
                 value_label = QLabel(f"{comp.mass_fraction * 100:.1f}%")
                 self._solid_layout.addRow(label, value_label)
+                total_ratio += comp.mass_fraction
+
+        # Separator before total
+        sep = QLabel("")
+        sep.setStyleSheet("border-bottom: 1px solid #d0d0d0; max-height: 1px;")
+        self._solid_layout.addRow(sep, QLabel(""))
+
+        if is_mixture:
+            total_label = QLabel("  Total:")
+            total_label.setStyleSheet("font-weight: bold; color: #2c2c2c;")
+            total_value = QLabel(f"{total_ratio:.4f}  ({total_ratio*100:.1f}%)")
+            total_value.setStyleSheet(
+                "color: #2e7d32; font-weight: bold;"
+                if abs(total_ratio - 1.0) < 0.01
+                else "color: #c62828; font-weight: bold;")
+            self._solid_layout.addRow(total_label, total_value)
+        else:
+            total_label = QLabel("  Total atoms:")
+            total_label.setStyleSheet("font-weight: bold; color: #2c2c2c;")
+            total_value = QLabel(f"{int(total_ratio)}")
+            total_value.setStyleSheet("font-weight: bold; color: #2c2c2c;")
+            self._solid_layout.addRow(total_label, total_value)
 
     def _update_placement(self, placement: Optional[Placement]):
         """Update placement display"""

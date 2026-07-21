@@ -1,10 +1,10 @@
 """
-AssignMaterialDialog — 批量材料分配对话框。
+AssignMaterialDialog -- batch material assignment dialog.
 
-与 cad2gdml 一致：
-- 右键 → 子菜单内嵌 QComboBox（不是展开 flat 菜单项，也不是弹新窗口）
-- 支持多选批量分配
-- 纯亮色主题
+Matches cad2gdml:
+- Right-click -> submenu with embedded QComboBox
+- Supports multi-select batch assignment
+- Pure light theme
 """
 
 from typing import Optional, List
@@ -26,11 +26,13 @@ COL_NODE_NAME = 0
 COL_SOURCE_FILE = 1
 COL_STATUS = 2
 COL_MATERIAL = 3
+COL_ENTRY_ID = 4
 
 HEADERS = ["Volume", "Source File", "Status", "Material"]
 
 MAT_ASSIGNED = "✅"
 MAT_UNASSIGNED = "❌"
+_DIM_COLOR = Qt.GlobalColor.gray  # color for non-assignable rows
 
 
 class _ComboHoverWatcher(QObject):
@@ -48,10 +50,10 @@ class _ComboHoverWatcher(QObject):
 
 
 class AssignMaterialDialog(QDialog):
-    """表格批量分配材料对话框。
+    """Batch material assignment dialog for the geometry table.
 
-    右键 assignable 行 → 子菜单 → 内嵌 QComboBox 选择 NIST/局部材料。
-    支持多选批量分配（同 cad2gdml）。
+    Right-click assignable row -> submenu -> embedded QComboBox for NIST/local material selection.
+    Supports multi-select batch assignment (same as cad2gdml).
     """
 
     materials_saved = pyqtSignal(int, int)  # assigned, total
@@ -86,8 +88,9 @@ class AssignMaterialDialog(QDialog):
         layout.addWidget(header)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(len(HEADERS))
+        self._table.setColumnCount(len(HEADERS) + 1)
         self._table.setHorizontalHeaderLabels(HEADERS)
+        self._table.setColumnHidden(COL_ENTRY_ID, True)
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(
@@ -131,31 +134,38 @@ class AssignMaterialDialog(QDialog):
 
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
 
-    # ---- Data Population ----
+    # ---- Data Population (matches cad2gdml: indented hierarchy + gray non-assignable) ----
 
     def _populate_table(self):
-        """递归填充表格——只包含 assignable 的节点（VOLUME_NODE / WORLD_NODE）。"""
+        """Recursively populate the table, preserving tree hierarchy. Non-assignable nodes shown in gray."""
         self._all_rows = []
         self._solid_nodes = []
         self._table.setRowCount(0)
 
         for file_node in self._gdml_agent.get_all_file_nodes():
-            self._append_node_rows(file_node)
+            self._append_node_rows(file_node, 0)
 
         self._table.setRowCount(len(self._all_rows))
 
-        for row, (node, assignable) in enumerate(self._all_rows):
+        for row, (node, depth, assignable) in enumerate(self._all_rows):
             if assignable:
                 self._solid_nodes.append(node)
 
-            # Node name
-            name_item = QTableWidgetItem(node.name)
+            # Node name with indentation (matches cad2gdml)
+            prefix = "  " * depth
+            display = prefix + node.name
+            name_item = QTableWidgetItem(display)
             name_item.setToolTip(node.name)
+            if not assignable:
+                name_item.setForeground(_DIM_COLOR)
             self._table.setItem(row, COL_NODE_NAME, name_item)
 
             # Source file
             src = self._get_source_file_name(node) if assignable else ""
-            self._table.setItem(row, COL_SOURCE_FILE, QTableWidgetItem(src))
+            src_item = QTableWidgetItem(src)
+            if not assignable:
+                src_item.setForeground(_DIM_COLOR)
+            self._table.setItem(row, COL_SOURCE_FILE, src_item)
 
             # Status + Material
             if assignable:
@@ -164,23 +174,40 @@ class AssignMaterialDialog(QDialog):
                 self._table.setItem(row, COL_STATUS, QTableWidgetItem(""))
                 self._table.setItem(row, COL_MATERIAL, QTableWidgetItem(""))
 
-    def _append_node_rows(self, node: GdmlNode):
-        """递归展平树到 _all_rows。"""
+            # Entry ID (hidden column, matches cad2gdml)
+            self._table.setItem(
+                row, COL_ENTRY_ID, QTableWidgetItem(node.entry_id))
+
+    def _append_node_rows(self, node: GdmlNode, depth: int):
+        """Recursively flatten tree into _all_rows, skipping structural intermediate nodes (SOLID_DEF etc.)."""
+        # Skip purely structural node types (SOLID_DEF, DEFINE/MATERIAL/AUX, PHYVOL)
+        skip_types = {
+            GdmlNodeType.SOLID_DEF,
+            GdmlNodeType.DEFINE_NODE,
+            GdmlNodeType.MATERIAL_NODE,
+            GdmlNodeType.AUX_NODE,
+            GdmlNodeType.PHYVOL_NODE,
+        }
+        if node.node_type in skip_types:
+            for child in node.children:
+                self._append_node_rows(child, depth)
+            return
+
         assignable = node.node_type in (GdmlNodeType.VOLUME_NODE,
                                          GdmlNodeType.WORLD_NODE)
-        self._all_rows.append((node, assignable))
+        self._all_rows.append((node, depth, assignable))
         for child in node.children:
-            self._append_node_rows(child)
+            self._append_node_rows(child, depth + 1)
 
     def _get_source_file_name(self, node: GdmlNode) -> str:
-        """回溯找到节点所属的 GDML 文件名。"""
+        """Trace back to find the GDML filename this node belongs to."""
         cur = node.parent
         while cur is not None and cur.node_type != GdmlNodeType.GDML_FILE:
             cur = cur.parent
         return cur.name if cur else ""
 
     def _update_row_status(self, row: int, node: GdmlNode):
-        """刷新 ✅/❌ 和材料名为 assignable 行。"""
+        """Refresh checkmark and material name for assignable rows."""
         mat = (node.material_name or "").strip()
         status_item = QTableWidgetItem(MAT_ASSIGNED if mat else MAT_UNASSIGNED)
         status_item.setToolTip("Assigned" if mat else "Not assigned")
@@ -192,7 +219,7 @@ class AssignMaterialDialog(QDialog):
     # ---- Right-click Context Menu (embedded QComboBox, same as cad2gdml) ----
 
     def _on_table_context_menu(self, pos):
-        """右键菜单——只有 assignable 行才弹出。"""
+        """Context menu -- only popped up for assignable rows."""
         # Collect selected assignable rows
         selected_rows = set()
         for item in self._table.selectedItems():
@@ -201,7 +228,7 @@ class AssignMaterialDialog(QDialog):
             return
 
         assignable_rows = {r for r in selected_rows
-                           if self._all_rows[r][1]}
+                           if self._all_rows[r][2]}
         if not assignable_rows:
             return
 
@@ -270,7 +297,7 @@ class AssignMaterialDialog(QDialog):
 
     def _apply_material_to_rows(self, material_name: str, rows: set):
         for row in rows:
-            node, assignable = self._all_rows[row]
+            node, depth, assignable = self._all_rows[row]
             if not assignable:
                 continue
             node.material_name = material_name
@@ -278,7 +305,7 @@ class AssignMaterialDialog(QDialog):
 
     def _clear_material(self, rows: set):
         for row in rows:
-            node, assignable = self._all_rows[row]
+            node, depth, assignable = self._all_rows[row]
             if not assignable:
                 continue
             node.material_name = ""
@@ -290,8 +317,8 @@ class AssignMaterialDialog(QDialog):
         rows = set()
         for item in self._table.selectedItems():
             rows.add(item.row())
-        assignable = sum(1 for r in rows if self._all_rows[r][1])
-        total = sum(1 for _, a in self._all_rows if a)
+        assignable = sum(1 for r in rows if self._all_rows[r][2])
+        total = sum(1 for _, _, a in self._all_rows if a)
         self._summary_label.setText(
             f"{assignable}/{total} assignable node(s) selected")
 

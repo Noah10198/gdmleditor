@@ -131,6 +131,10 @@ class GdmlAgent:
     def get_placement_override(self, entry_id: str) -> Optional[Placement]:
         return self._placement_overrides.get(entry_id)
 
+    def get_all_placement_overrides(self) -> Dict[str, Placement]:
+        """Return the entire overrides dict (for export)."""
+        return dict(self._placement_overrides)
+
     def clear_placement_override(self, entry_id: str):
         self._placement_overrides.pop(entry_id, None)
         node = self._entry_id_map.get(entry_id)

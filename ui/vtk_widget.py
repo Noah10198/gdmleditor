@@ -12,7 +12,7 @@ Design:
   - Exposes the same public API as before (get_scene, build_scene, ...).
 """
 
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Callable
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -355,7 +355,7 @@ class VtkWidget(QWidget):
             ren.AddActor(self._cube_axes)
 
     def _update_cube_axes_bounds(self):
-        """Recompute CubeAxes bounds from all actors in the scene."""
+        """Recompute CubeAxes bounds from all GDML actors (skip cube axes itself)."""
         if not self._scene.renderer:
             return
         coll = self._scene.renderer.GetViewProps()
@@ -365,7 +365,7 @@ class VtkWidget(QWidget):
         has_geom = False
         for i in range(coll.GetNumberOfItems()):
             prop = coll.GetItemAsObject(i)
-            if isinstance(prop, vtkActor):
+            if isinstance(prop, vtkActor) and prop is not self._cube_axes:
                 b = prop.GetBounds()
                 if b:
                     for k in range(6):
@@ -378,8 +378,11 @@ class VtkWidget(QWidget):
             for k in range(6):
                 if bounds[k] in (float('inf'), -float('inf')):
                     bounds[k] = 0.0
-            self._cube_axes.SetBounds(bounds)
-            self._clip_bounds = bounds
+        else:
+            # No geometry: reset to default small bounds
+            bounds = [-10, 10, -10, 10, -10, 10]
+        self._cube_axes.SetBounds(bounds)
+        self._clip_bounds = bounds
 
     # ── Public API ──
 
@@ -387,7 +390,7 @@ class VtkWidget(QWidget):
         """Get the scene manager."""
         return self._scene
 
-    def build_scene(self, root_node: GdmlNode) -> None:
+    def build_scene(self, root_node: GdmlNode, *, render_all_volumes: bool = False) -> None:
         """Build scene from GDML tree, preserving grid/axes."""
         if not self._scene:
             return
@@ -395,13 +398,21 @@ class VtkWidget(QWidget):
         self._gdml_actors.clear()
         self._original_colors.clear()
 
-        self._scene.build_from_tree(root_node)
+        self._scene.build_from_tree(root_node, render_all_volumes=render_all_volumes)
         self._ensure_default_actors()
 
         # After build, recollect GDML actors and update cube axes bounds
         self._collect_gdml_actors()
         self._update_cube_axes_bounds()
         self.render()
+
+    def set_override_provider(
+            self,
+            provider: Optional[Callable[[str], Optional['Placement']]]
+    ):
+        """Set placement override provider on the scene (forwarded from agent)."""
+        if self._scene:
+            self._scene.set_override_provider(provider)
 
     def _collect_gdml_actors(self):
         """Collect all GDML actors (non-default) for color/opacity management."""
@@ -584,4 +595,47 @@ class VtkWidget(QWidget):
             cam.SetFocalPoint(cx, cy, cz)
             cam.SetViewUp(0, 1, 0)
         self._scene.renderer.ResetCameraClippingRange()
+        self.render()
+
+
+# ── VtkPreviewWidget (minimal, for solid preview) ──────────────────
+
+
+class VtkPreviewWidget(VtkWidget):
+    """Minimal VTK preview widget — no toolbar, no clip, just the scene + CubeAxes."""
+
+    def _build_ui(self):
+        """Build minimal layout: VTK viewport only (no toolbar)."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._vtk_interactor = QVTKRenderWindowInteractor(self)
+        layout.addWidget(self._vtk_interactor, 1)
+
+    def _toggle_transparency(self):
+        pass
+
+    def _toggle_edges(self):
+        pass
+
+    def _toggle_clip_panel(self):
+        pass
+
+    def _toggle_projection(self):
+        pass
+
+    def _fit_all(self):
+        if self._scene:
+            self._scene.renderer.ResetCamera()
+            self._scene.renderer.ResetCameraClippingRange()
+            self.render()
+
+    def set_dark_theme(self, is_dark: bool) -> None:
+        if not self._scene:
+            return
+        if is_dark:
+            self._scene.set_background_color(0.12, 0.12, 0.18)
+        else:
+            self._scene.set_background_color(0.95, 0.95, 0.95)
         self.render()

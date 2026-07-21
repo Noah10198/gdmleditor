@@ -1,46 +1,42 @@
 """
-Add Local Material Dialog — 创建自定义局部材料。
+LocalMaterialDialog -- dialog for adding local materials (Compound/Mixture).
 
-支持两种配方方式：
-1. 化合物（Compound）：原子数比例，ex: H₂O
-2. 混合物（Mixture）：质量比例，ex: 空气
-
-（从 cad2gdml/ui/local_material_dialog.py 适配而来）
+Matches cad2gdml style and layout:
+- QComboBox for type selection (Compound / Mixture)
+- QHBoxLayout inline rows for element composition
+- Light theme (#0078d4 accent color)
+- Uses CompoundItem/MixtureItem data structures
 """
 
-import uuid
-from typing import Optional
-
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTabWidget,
-    QWidget, QLabel, QLineEdit, QDoubleSpinBox, QComboBox, QFormLayout,
-    QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QAbstractItemView,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
+    QDoubleSpinBox, QComboBox, QPushButton, QWidget, QGroupBox,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 
 from core.materials_lib import (
-    MaterialsLib, CompoundItem, MixtureItem,
-    CompoundMaterial, MixtureMaterial, CustomElement,
+    MaterialsLib, CompoundMaterial, CompoundItem,
+    MixtureMaterial, MixtureItem,
 )
 
 
-class _CompositionItem:
-    """在编辑器内部使用的一行组分数据。"""
-    def __init__(self, symbol: str, value: float):
-        self.symbol = symbol
-        self.value = value
+class _CompositionRow:
+    """One composition row: element combo + ratio spinbox."""
+    def __init__(self, combo: QComboBox, spin: QDoubleSpinBox):
+        self.combo = combo
+        self.spin = spin
 
 
 class LocalMaterialDialog(QDialog):
-    """添加局部材料的对话框（化合物 + 混合物两页）。"""
+    """Dialog for adding local materials, matching cad2gdml layout/colors."""
+
+    _TOTAL_TOLERANCE = 0.01  # tolerance for mixture total == 1.0 check
 
     def __init__(self, mat_lib: MaterialsLib, parent=None):
         super().__init__(parent)
         self._mat_lib = mat_lib
-        self._items: list[_CompositionItem] = []
+        self._rows: list[_CompositionRow] = []
         self._last_gdml: str = ""
+        self._last_mat_id: str = ""
 
         self.setWindowTitle("Add Local Material")
         self.setMinimumSize(520, 400)
@@ -50,280 +46,382 @@ class LocalMaterialDialog(QDialog):
         self._apply_theme()
 
     def _build_ui(self):
-        main_layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
 
-        # 顶部：配方类型（化合物/混合物）
-        self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_compound_tab(), "Compound (atom ratio)")
-        self._tabs.addTab(self._build_mixture_tab(), "Mixture (mass ratio)")
-        main_layout.addWidget(self._tabs)
+        # -- Type selector (QComboBox, same as cad2gdml) --
+        cat_layout = QHBoxLayout()
+        cat_layout.addWidget(QLabel("Type:"))
+        self._cat_combo = QComboBox()
+        self._cat_combo.addItem("Compound (atom ratio)", "compound")
+        self._cat_combo.addItem("Mixture (mass fraction)", "mixture")
+        self._cat_combo.currentIndexChanged.connect(self._on_category_changed)
+        cat_layout.addWidget(self._cat_combo)
+        cat_layout.addStretch()
+        layout.addLayout(cat_layout)
 
-        # 材料属性
-        prop_group = QGroupBox("Material Properties")
-        prop_form = QFormLayout(prop_group)
-        self._mat_name_edit = QLineEdit()
-        self._mat_name_edit.setPlaceholderText("e.g. my_water, custom_steel")
-        prop_form.addRow("Material Name:", self._mat_name_edit)
+        # -- Basic Info --
+        common_group = QGroupBox("Basic Info")
+        common_layout = QFormLayout(common_group)
+        common_layout.setSpacing(4)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("e.g. my_steel, my_water...")
+        common_layout.addRow("Name:", self._name_edit)
+
         self._density_spin = QDoubleSpinBox()
-        self._density_spin.setRange(0.0001, 100.0)
         self._density_spin.setDecimals(4)
+        self._density_spin.setRange(0, 1e9)
         self._density_spin.setValue(1.0)
-        self._density_spin.setSuffix(" g/cm³")
-        prop_form.addRow("Density:", self._density_spin)
-        main_layout.addWidget(prop_group)
+        self._density_spin.setToolTip("Density in g/cm3")
+        common_layout.addRow("Density (g/cm3):", self._density_spin)
 
-        # 底部按钮
+        layout.addWidget(common_group)
+
+        # -- Composition (inline rows, same as cad2gdml) --
+        self._comp_group = QGroupBox("Composition")
+        comp_layout = QVBoxLayout(self._comp_group)
+
+        # Header row
+        comp_header = QHBoxLayout()
+        comp_header.addWidget(QLabel("Element"))
+        comp_header.addWidget(QLabel("Ratio"))
+        comp_header.addStretch()
+        comp_layout.addLayout(comp_header)
+
+        # Items container
+        self._items_widget = QWidget()
+        self._items_layout = QVBoxLayout(self._items_widget)
+        self._items_layout.setContentsMargins(0, 0, 0, 0)
+        self._items_layout.setSpacing(4)
+        comp_layout.addWidget(self._items_widget)
+
+        # Total proportion label (for mixture validation feedback)
+        total_row = QHBoxLayout()
+        total_row.addStretch()
+        self._total_label = QLabel("")
+        total_row.addWidget(self._total_label)
+        comp_layout.addLayout(total_row)
+
+        add_item_btn = QPushButton("+ Add Element")
+        add_item_btn.clicked.connect(self._add_composition_row)
+        comp_layout.addWidget(add_item_btn)
+
+        layout.addWidget(self._comp_group)
+
+        # -- Buttons --
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self._preview_btn = QPushButton("Preview GDML")
-        self._preview_btn.clicked.connect(self._on_preview)
-        btn_layout.addWidget(self._preview_btn)
-        self._ok_btn = QPushButton("Add Material")
-        self._ok_btn.clicked.connect(self._on_ok)
-        btn_layout.addWidget(self._ok_btn)
+        save_btn = QPushButton("Add Material")
+        save_btn.clicked.connect(self._on_save)
+        btn_layout.addWidget(save_btn)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
-        main_layout.addLayout(btn_layout)
+        layout.addLayout(btn_layout)
 
-        # 预览区
-        self._preview_label = QLabel("")
-        self._preview_label.setWordWrap(True)
-        self._preview_label.setStyleSheet(
-            "background: #2d2d3a; color: #b0b0c0; padding: 8px; "
-            "border-radius: 4px; font-family: Consolas, monospace; font-size: 11px;")
-        self._preview_label.setMaximumHeight(120)
-        self._preview_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        main_layout.addWidget(self._preview_label)
+        # Add first row by default
+        self._add_composition_row()
 
-    def _build_compound_tab(self) -> QWidget:
-        """化合物选项卡（原子数比例）。"""
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        instr = QLabel("Define compound using atomic ratios (e.g. 2 H + 1 O = H₂O)")
-        instr.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(instr)
+    # -- Composition rows --
 
-        # 添加行
-        add_row = QHBoxLayout()
-        self._comp_elem_combo = QComboBox()
-        self._comp_elem_combo.setEditable(True)
-        self._comp_atom_spin = QDoubleSpinBox()
-        self._comp_atom_spin.setRange(0.01, 1000.0)
-        self._comp_atom_spin.setValue(1.0)
-        self._comp_atom_spin.setDecimals(2)
-        add_btn = QPushButton("Add Element")
-        add_btn.clicked.connect(self._on_add_compound_row)
+    def _add_composition_row(self):
+        """Add one element composition row (same QHBoxLayout pattern as cad2gdml)."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
 
-        add_row.addWidget(QLabel(" Element:"))
-        add_row.addWidget(self._comp_elem_combo)
-        add_row.addWidget(QLabel(" Atoms:"))
-        add_row.addWidget(self._comp_atom_spin)
-        add_row.addWidget(add_btn)
-        add_row.addStretch()
-        layout.addLayout(add_row)
-
-        # 表格
-        self._comp_table = QTableWidget()
-        self._comp_table.setColumnCount(3)
-        self._comp_table.setHorizontalHeaderLabels(["Symbol", "Atoms", "Remove"])
-        self._comp_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self._comp_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        layout.addWidget(self._comp_table)
-
-        # 填充元素下拉
-        self._populate_element_combo(self._comp_elem_combo)
-
-        return w
-
-    def _build_mixture_tab(self) -> QWidget:
-        """混合物选项卡（质量比例）。"""
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        instr = QLabel("Define mixture using mass fractions (total = sum of fractions)")
-        instr.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(instr)
-
-        # 添加行
-        add_row = QHBoxLayout()
-        self._mix_elem_combo = QComboBox()
-        self._mix_elem_combo.setEditable(True)
-        self._mix_frac_spin = QDoubleSpinBox()
-        self._mix_frac_spin.setRange(0.001, 1000.0)
-        self._mix_frac_spin.setValue(1.0)
-        self._mix_frac_spin.setDecimals(3)
-        add_btn = QPushButton("Add Element")
-        add_btn.clicked.connect(self._on_add_mixture_row)
-
-        add_row.addWidget(QLabel(" Element:"))
-        add_row.addWidget(self._mix_elem_combo)
-        add_row.addWidget(QLabel(" Mass:"))
-        add_row.addWidget(self._mix_frac_spin)
-        add_row.addWidget(add_btn)
-        add_row.addStretch()
-        layout.addLayout(add_row)
-
-        # 表格
-        self._mix_table = QTableWidget()
-        self._mix_table.setColumnCount(3)
-        self._mix_table.setHorizontalHeaderLabels(["Symbol", "Mass Fraction", "Remove"])
-        self._mix_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self._mix_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
-        layout.addWidget(self._mix_table)
-
-        # 填充元素下拉
-        self._populate_element_combo(self._mix_elem_combo)
-
-        return w
-
-    def _populate_element_combo(self, combo: QComboBox):
-        """用元素周期表填充下拉框。"""
+        combo = QComboBox()
         elements = MaterialsLib.get_all_elements()
-        for symbol, (z, weight) in sorted(elements.items(),
-                                          key=lambda x: x[1][0]):
-            combo.addItem(f"{symbol} (Z={int(z)}, A={weight:.4f})",
-                          symbol)
+        sorted_elems = sorted(elements.items(), key=lambda x: x[1][0])
+        combo.addItem("Select element...", "")
+        for symbol, (z, atom_weight) in sorted_elems:
+            combo.addItem(
+                f"{symbol} (Z={int(z):d})", symbol)
+        row.addWidget(combo)
 
-    def _on_add_compound_row(self):
-        symbol = self._comp_elem_combo.currentData()
-        if not symbol:
-            QMessageBox.warning(self, "Warning", "Please select an element.")
+        is_mixture = self._cat_combo.currentData() == "mixture"
+        spin = QDoubleSpinBox()
+        spin.setDecimals(4 if is_mixture else 0)
+        spin.setRange(0, 1e9)
+        spin.setSingleStep(0.0001 if is_mixture else 1.0)
+        spin.setValue(1)
+        spin.setToolTip(
+            "Mass fraction" if is_mixture else "Atom count")
+        spin.valueChanged.connect(self._update_total_display)
+        row.addWidget(spin)
+
+        remove_btn = QPushButton("x")
+        remove_btn.setFixedWidth(28)
+        remove_btn.clicked.connect(
+            lambda checked, r=row: self._remove_row(r))
+        row.addWidget(remove_btn)
+
+        combo.currentIndexChanged.connect(self._update_total_display)
+
+        self._items_layout.addLayout(row)
+        self._rows.append(_CompositionRow(combo, spin))
+        self._update_total_display()
+
+    def _remove_row(self, row_layout: QHBoxLayout):
+        """Remove one composition row."""
+        for i, cr in enumerate(self._rows[:]):
+            found = False
+            for j in range(row_layout.count()):
+                w = row_layout.itemAt(j)
+                if w and w.widget() in (cr.combo, cr.spin):
+                    found = True
+                    break
+            if found:
+                self._rows.remove(cr)
+                break
+        while row_layout.count():
+            item = row_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        idx = self._items_layout.indexOf(row_layout)
+        if idx >= 0:
+            self._items_layout.takeAt(idx)
+        self._update_total_display()
+
+    def _update_total_display(self):
+        """Update the total proportion label based on current data."""
+        is_mixture = self._cat_combo.currentData() == "mixture"
+        if not is_mixture:
+            self._total_label.setText("")
             return
-        atoms = self._comp_atom_spin.value()
-        self._add_table_row(self._comp_table, symbol, atoms)
 
-    def _on_add_mixture_row(self):
-        symbol = self._mix_elem_combo.currentData()
-        if not symbol:
-            QMessageBox.warning(self, "Warning", "Please select an element.")
+        total = 0.0
+        has_valid = False
+        for cr in self._rows:
+            sym = cr.combo.currentData()
+            if not sym:
+                continue
+            has_valid = True
+            total += cr.spin.value()
+
+        if not has_valid:
+            self._total_label.setText("")
             return
-        mass = self._mix_frac_spin.value()
-        self._add_table_row(self._mix_table, symbol, mass)
 
-    def _add_table_row(self, table: QTableWidget, symbol: str, value: float):
-        row = table.rowCount()
-        table.insertRow(row)
+        diff = abs(total - 1.0)
+        if diff < self._TOTAL_TOLERANCE:
+            self._total_label.setText(
+                f"Total: {total:.4f}  (OK)")
+            self._total_label.setStyleSheet(
+                "color: #2e7d32; font-size: 11px; font-weight: bold;")
+        else:
+            self._total_label.setText(
+                f"Total: {total:.4f}  (should be 1.0)")
+            self._total_label.setStyleSheet(
+                "color: #c62828; font-size: 11px; font-weight: bold;")
 
-        sym_item = QTableWidgetItem(symbol)
-        sym_item.setFlags(sym_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        table.setItem(row, 0, sym_item)
+    # -- Category switch --
 
-        val_item = QTableWidgetItem(f"{value:.4f}")
-        val_item.setFlags(val_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        table.setItem(row, 1, val_item)
+    def _on_category_changed(self, idx: int):
+        """Update spinbox precision when switching Compound/Mixture."""
+        is_mixture = self._cat_combo.currentData() == "mixture"
+        decimals = 4 if is_mixture else 0
+        for cr in self._rows:
+            cr.spin.setDecimals(decimals)
+            cr.spin.setSingleStep(0.0001 if is_mixture else 1.0)
+            if not is_mixture:
+                cr.spin.setValue(int(cr.spin.value()))
+        self._update_total_display()
 
-        del_btn = QPushButton("✕")
-        del_btn.setFixedSize(28, 24)
-        del_btn.clicked.connect(lambda: self._remove_table_row(table, row))
-        table.setCellWidget(row, 2, del_btn)
+    # -- Save --
 
-    def _remove_table_row(self, table: QTableWidget, row: int):
-        table.removeRow(row)
-
-    def _on_preview(self):
-        """生成并显示 GDML 预览。"""
-        name = self._mat_name_edit.text().strip()
+    def _on_save(self):
+        name = self._name_edit.text().strip()
         if not name:
-            QMessageBox.warning(self, "Warning", "Please enter a material name.")
+            self._name_edit.setStyleSheet(
+                "border: 1px solid #e74c3c; background-color: #fff0f0;")
             return
-
-        density = self._density_spin.value()
-        mat_id = f"local_{uuid.uuid4().hex[:8]}"
-
-        # 判断当前选项卡
-        current_tab = self._tabs.currentIndex()
-
-        if current_tab == 0:
-            # 化合物
-            items = self._collect_table_data(self._comp_table)
-            if not items:
-                QMessageBox.warning(self, "Warning",
-                                    "Please add at least one element.")
-                return
-            mat = CompoundMaterial(mat_id, name, density, [
-                CompoundItem(it.symbol, it.value) for it in items
-            ])
         else:
-            # 混合物
-            items = self._collect_table_data(self._mix_table)
-            if not items:
-                QMessageBox.warning(self, "Warning",
-                                    "Please add at least one element.")
+            self._name_edit.setStyleSheet(
+                "border: 1px solid #d0d0d0; background-color: #ffffff;")
+
+        valid_items = []
+        for cr in self._rows:
+            sym = cr.combo.currentData()
+            if not sym:
+                continue
+            valid_items.append((cr, sym))
+
+        if not valid_items:
+            self._name_edit.setStyleSheet(
+                "border: 1px solid #e74c3c; background-color: #fff0f0;")
+            return
+
+        cat = self._cat_combo.currentData()
+
+        # For mixture, validate total proportion is close to 1.0
+        if cat == "mixture":
+            total = sum(cr.spin.value() for cr, _ in valid_items)
+            if abs(total - 1.0) > self._TOTAL_TOLERANCE:
+                self._total_label.setStyleSheet(
+                    "color: #c62828; font-size: 11px; font-weight: bold;")
                 return
-            mat = MixtureMaterial(mat_id, name, density, [
-                MixtureItem(it.symbol, it.value) for it in items
-            ])
+            self._update_total_display()
 
-        gdml = self._mat_lib.to_gdml_string(mat_id)
-        self._last_gdml = gdml
-        self._preview_label.setText(gdml)
+        # Generate a unique material ID
+        mat_id = self._mat_lib.generate_id()
 
-        # 保存好，以备后续确认
-        if current_tab == 0:
-            self._pending_mat = mat
+        if cat == "compound":
+            components = []
+            for cr, sym in valid_items:
+                components.append(CompoundItem(
+                    symbol=sym,
+                    atom_count=int(cr.spin.value()),
+                ))
+            mat = CompoundMaterial(
+                mat_id=mat_id,
+                mat_name=name,
+                density=round(self._density_spin.value(), 4),
+                components=components,
+            )
+            self._mat_lib.add_compound(mat)
         else:
-            self._pending_mat = mat
-        self._is_compound = (current_tab == 0)
+            components = []
+            for cr, sym in valid_items:
+                components.append(MixtureItem(
+                    symbol=sym,
+                    mass_fraction=round(cr.spin.value(), 4),
+                ))
+            mat = MixtureMaterial(
+                mat_id=mat_id,
+                mat_name=name,
+                density=round(self._density_spin.value(), 4),
+                components=components,
+            )
+            self._mat_lib.add_mixture(mat)
 
-    def _collect_table_data(self, table: QTableWidget) -> list:
-        """从表格收集组分数据。"""
-        items = []
-        for row in range(table.rowCount()):
-            sym = table.item(row, 0).text()
-            val = float(table.item(row, 1).text())
-            items.append(_CompositionItem(sym, val))
-        return items
-
-    def _on_ok(self):
-        """确认添加材料到库。"""
-        if not hasattr(self, '_pending_mat') or self._pending_mat is None:
-            QMessageBox.warning(
-                self, "Warning",
-                "Please click 'Preview GDML' first to validate.")
-            return
-
-        if not self._last_gdml:
-            QMessageBox.warning(
-                self, "Warning",
-                "GDML preview is empty. Please check your input.")
-            return
-
-        if isinstance(self._pending_mat, CompoundMaterial):
-            self._mat_lib.add_compound(self._pending_mat)
-        elif isinstance(self._pending_mat, MixtureMaterial):
-            self._mat_lib.add_mixture(self._pending_mat)
-
-        QMessageBox.information(
-            self, "Success",
-            f"Material '{self._pending_mat.mat_name}' has been added.")
+        self._last_mat_id = mat_id
+        self._last_gdml = self._mat_lib.to_gdml_string(mat_id)
         self.accept()
 
+    @property
+    def last_gdml(self) -> str:
+        return self._last_gdml
+
+    @property
+    def last_mat_id(self) -> str:
+        return self._last_mat_id
+
+    # -- Theme --
+
     def _apply_theme(self):
+        """Apply light theme matching cad2gdml exactly."""
         self.setStyleSheet("""
-            QGroupBox { font-size: 12px; font-weight: bold;
-                         border: 1px solid #4a4a5a; border-radius: 4px;
-                         margin-top: 8px; padding: 12px 8px 8px 8px; }
-            QGroupBox::title { subcontrol-origin: margin;
-                               left: 10px; padding: 0 4px; }
-            QLineEdit, QDoubleSpinBox, QComboBox {
-                padding: 3px 6px; font-size: 12px;
-                border: 1px solid #4a4a5a; border-radius: 3px;
-                background: #2a2a3a; color: #e0e0e0; }
+            QDialog {
+                background-color: #ffffff;
+            }
+            QLabel {
+                color: #2c2c2c;
+                font-size: 12px;
+            }
+            QGroupBox {
+                font-size: 13px;
+                font-weight: bold;
+                color: #555555;
+                border: 1px solid #cccccc;
+                border-radius: 4px;
+                margin-top: 8px;
+                padding-top: 16px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 2px 8px;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox {
+                background-color: #ffffff;
+                color: #2c2c2c;
+                border: 1px solid #d0d0d0;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                min-height: 22px;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #0078d4;
+                background-color: #f8f9fa;
+            }
+            QComboBox {
+                background-color: #ffffff;
+                color: #2c2c2c;
+                border: 1px solid #d0d0d0;
+                border-radius: 6px;
+                padding: 4px 24px 4px 10px;
+                font-size: 12px;
+                min-height: 22px;
+            }
+            QComboBox:hover {
+                border: 1px solid #0078d4;
+                background-color: #f8f9fa;
+            }
+            QComboBox:on {
+                border: 1px solid #0078d4;
+                background-color: #f0f4ff;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border: none;
+                border-left: 1px solid #e0e0e0;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+            QComboBox:hover::drop-down {
+                border-left: 1px solid #0078d4;
+            }
+            QComboBox::down-arrow {
+                width: 0;
+                height: 0;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #666666;
+                margin: 2px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #ffffff;
+                color: #2c2c2c;
+                border: 1px solid #d0d0d0;
+                border-radius: 8px;
+                padding: 4px;
+                outline: none;
+                selection-background-color: transparent;
+                selection-color: #2c2c2c;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 6px 10px;
+                min-height: 24px;
+                border-radius: 4px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #e8f0fe;
+                color: #1a1a1a;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #d2e3fc;
+                color: #1a1a1a;
+            }
             QPushButton {
-                padding: 4px 12px; font-size: 12px;
-                border: 1px solid #4a4a5a; border-radius: 3px;
-                background: #3a3a4e; color: #e0e0e0; }
-            QPushButton:hover { background: #4a4a5e; }
-            QTableWidget {
-                background: #2a2a3a; color: #e0e0e0;
-                gridline-color: #3a3a4a; font-size: 12px; }
-            QTableWidget::item { padding: 2px 4px; }
-            QHeaderView::section {
-                background: #3a3a4e; color: #b0b0c0;
-                padding: 4px; border: 1px solid #4a4a5a; }
+                background-color: #f0f0f0;
+                color: #2c2c2c;
+                border: 1px solid #d0d0d0;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-size: 12px;
+                font-weight: 500;
+                min-height: 22px;
+            }
+            QPushButton:hover {
+                background-color: #e4e7eb;
+                border: 1px solid #0078d4;
+            }
+            QPushButton:pressed {
+                background-color: #d2d5d9;
+            }
         """)

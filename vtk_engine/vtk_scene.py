@@ -55,6 +55,10 @@ class VtkScene:
         self._selected_id: Optional[str] = None
         self._selected_actor: Optional[vtkActor] = None
 
+        # Placement override provider: callable(entry_id) -> Optional[Placement]
+        # Used by GdmlAgent to override physvol placements from the edit overlay
+        self._override_provider: Optional[Callable[[str], Optional[Placement]]] = None
+
         # Picking
         self._pick_handler: Optional[Callable[[str], None]] = None
         self._picker = vtkCellPicker()
@@ -189,6 +193,22 @@ class VtkScene:
     def get_selected_id(self) -> Optional[str]:
         return self._selected_id
 
+    def set_override_provider(
+            self,
+            provider: Optional[Callable[[str], Optional[Placement]]]
+    ):
+        """
+        Set a provider function that returns placement overrides by entry_id.
+
+        The provider is called during _apply_node_placement for each PHYVOL_NODE
+        encountered in the parent chain. If it returns a Placement, that value
+        is used instead of the node's own placement.
+
+        Args:
+            provider: callable(entry_id) -> Optional[Placement], or None to disable
+        """
+        self._override_provider = provider
+
     # ==================== Placement operations ====================
 
     def move_node(self, entry_id: str, dx: float, dy: float, dz: float):
@@ -215,27 +235,50 @@ class VtkScene:
     def _apply_node_placement(self, actor: vtkActor, node: GdmlNode):
         """
         Collect all placement info from the node's parent chain.
-        Accumulates placement from each PHYVOL_NODE encountered.
+
+        Accumulates placement from:
+        - PHYVOL_NODE ancestors: individual physvol placements
+          (with override support via _override_provider)
+        - GDML_FILE ancestors: file-level transform (translates/rotates
+          the entire imported file as a single group)
         """
         tx, ty, tz = 0.0, 0.0, 0.0
         rx, ry, rz = 0.0, 0.0, 0.0
 
         current = node.parent
         while current is not None:
-            if current.node_type == GdmlNodeType.PHYVOL_NODE and current.placement:
+            if current.node_type == GdmlNodeType.PHYVOL_NODE:
+                # Start from the original GDML placement, then check for override
                 p = current.placement
-                tx += p.x
-                ty += p.y
-                tz += p.z
-                rx += p.rot_x
-                ry += p.rot_y
-                rz += p.rot_z
+                if self._override_provider and current.entry_id:
+                    override = self._override_provider(current.entry_id)
+                    if override is not None:
+                        p = override
+                if p is not None:
+                    tx += p.x
+                    ty += p.y
+                    tz += p.z
+                    rx += p.rot_x
+                    ry += p.rot_y
+                    rz += p.rot_z
+            elif current.node_type == GdmlNodeType.GDML_FILE:
+                ft = current.file_transform
+                if ft is not None:
+                    tx += ft.x
+                    ty += ft.y
+                    tz += ft.z
+                    rx += ft.rot_x
+                    ry += ft.rot_y
+                    rz += ft.rot_z
             current = current.parent
 
         actor.SetPosition(tx, ty, tz)
-        # VTK's SetOrientation uses ZYX Euler angles
+        # GDML uses a PASSIVE (frame) convention for rotations, while
+        # VTK's SetOrientation is an ACTIVE (object) rotation.
+        # The two are inverses of each other, so GDML values must be
+        # negated to produce the correct visual result.
         if abs(rx) > 0.001 or abs(ry) > 0.001 or abs(rz) > 0.001:
-            actor.SetOrientation(rx, ry, rz)
+            actor.SetOrientation(-rx, -ry, -rz)
 
     def update_placement(self, node: GdmlNode):
         """Update node placement"""
@@ -296,13 +339,17 @@ class VtkScene:
 
     # ==================== Scene building ====================
 
-    def build_from_tree(self, root_node: GdmlNode):
+    def build_from_tree(self, root_node: GdmlNode, *, render_all_volumes: bool = False):
         """
         Recursively build scene from GdmlNode tree.
-        Traverses all VOLUME_NODE / WORLD_NODE and creates actors.
+        Traverses all nodes and creates actors for volumes with solid params.
 
         Args:
             root_node: Root node
+            render_all_volumes: If True, render every VOLUME_NODE that has
+                solid_params (used for solid preview). If False (default),
+                only render WORLD_NODE and PHYVOL_NODE instance volumes,
+                skipping LogicalVolumeStore definitions.
         """
         self.clear()
 
@@ -313,24 +360,58 @@ class VtkScene:
         for file_node in root_node.children:
             if file_node.node_type != GdmlNodeType.GDML_FILE:
                 continue
-            self._build_node_recursive(file_node)
+            self._build_node_recursive(file_node, render_all_volumes=render_all_volumes)
 
         self.reset_camera()
         self.render()
 
-    def _build_node_recursive(self, node: GdmlNode):
-        """
-        Recursively build scene nodes.
+    @staticmethod
+    def _is_under_world(node: GdmlNode) -> bool:
+        """Check if a node belongs to the physical world hierarchy.
 
-        Creates actor for VOLUME_NODE / WORLD_NODE with solid_params.
-        GROUP nodes (like PHYVOL) have no special treatment -- children are recursed.
+        Walks up the parent chain to see if any ancestor is WORLD_NODE.
+        This distinguishes instances under the world tree from instances
+        under definition volumes (which are part of the LogicalVolumeStore
+        and should NOT be rendered directly).
         """
-        if (node.node_type in (GdmlNodeType.VOLUME_NODE, GdmlNodeType.WORLD_NODE)
-                and node.solid_params):
-            self.add_node(node)
+        parent = node.parent
+        while parent is not None:
+            if parent.node_type == GdmlNodeType.WORLD_NODE:
+                return True
+            parent = parent.parent
+        return False
+
+    def _build_node_recursive(self, node: GdmlNode, *, render_all_volumes: bool = False):
+        """
+        Recursively build scene nodes from the GdmlNode tree.
+
+        Normal mode (render_all_volumes=False):
+        - VOLUME_NODE definitions (direct children of GDML_FILE) are the
+          "LogicalVolumeStore" — they are NOT rendered directly.
+        - Only two types create actors:
+          1. WORLD_NODE — the top-level reference from <setup>
+          2. Instance VOLUME_NODEs — clones created under PHYVOL_NODEs
+             that are part of the WORLD_NODE subtree, representing
+             G4PVPlacements with their own spatial transform.
+
+        Preview mode (render_all_volumes=True):
+        - Any VOLUME_NODE with solid_params is rendered, regardless of parent.
+          This is used for the single-solid preview window.
+        """
+        if node.solid_params:
+            if render_all_volumes:
+                self.add_node(node)
+            else:
+                is_world = node.node_type == GdmlNodeType.WORLD_NODE
+                is_instance = (node.node_type == GdmlNodeType.VOLUME_NODE
+                               and node.parent
+                               and node.parent.node_type == GdmlNodeType.PHYVOL_NODE
+                               and self._is_under_world(node))
+                if is_world or is_instance:
+                    self.add_node(node)
 
         for child in node.children:
-            self._build_node_recursive(child)
+            self._build_node_recursive(child, render_all_volumes=render_all_volumes)
 
     def get_actor_for_node(self, entry_id: str) -> Optional[vtkActor]:
         """Get actor for a given node"""

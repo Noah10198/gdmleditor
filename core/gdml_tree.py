@@ -79,6 +79,10 @@ class GdmlNode(QObject):
         self._children: List['GdmlNode'] = []
         self._entry_id: str = ""
 
+        # File-level transform (only used by GDML_FILE nodes)
+        # Allows translating/rotating an entire imported file's geometry as a group
+        self._file_transform: Optional[Placement] = None
+
         # Reference relations: volume references solid; physvol references volume
         self._ref_name: str = ""  # e.g. volumeref or solidref ref attribute value
 
@@ -139,6 +143,19 @@ class GdmlNode(QObject):
     @placement.setter
     def placement(self, val: Optional[Placement]):
         self._placement = val
+
+    @property
+    def file_transform(self) -> Optional[Placement]:
+        """
+        File-level transform (GDML_FILE nodes only).
+        Translates/rotates ALL geometry in this file as a single group.
+        Returns None if no file transform is set.
+        """
+        return self._file_transform
+
+    @file_transform.setter
+    def file_transform(self, val: Optional[Placement]):
+        self._file_transform = val
 
     @property
     def vtk_actor(self):

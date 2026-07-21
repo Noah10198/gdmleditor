@@ -32,6 +32,8 @@ from ui.vtk_widget import VtkWidget
 from ui.redefine_world_dialog import RedefineWorldDialog
 from ui.assign_material_dialog import AssignMaterialDialog
 from ui.local_material_dialog import LocalMaterialDialog
+from ui.transform_dialog import TransformDialog
+from core.gdml_tree import Placement
 
 
 class MainWindow(QMainWindow):
@@ -40,7 +42,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GDML Editor - gdmleditor")
         self.resize(1400, 900)
-        self._dark_theme = True
+        self._dark_theme = False
 
         self._gdml_agent = GdmlAgent()
         self._logger = AsyncLogger()
@@ -62,7 +64,7 @@ class MainWindow(QMainWindow):
         self._init_material_library()
 
         # Apply theme (after all widgets created)
-        self._apply_global_theme(True)
+        self._apply_global_theme(False)
 
         self._connect_signals()
 
@@ -71,7 +73,7 @@ class MainWindow(QMainWindow):
     # ==================== Material Library ====================
 
     def _init_material_library(self):
-        """初始化材料库：加载元素周期表 + NIST 材料。"""
+        """Initialize material library: load elements + NIST materials."""
         data_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
         )
@@ -92,13 +94,13 @@ class MainWindow(QMainWindow):
             self._logger.log_system(f"nist.txt not found at {nist_path}",
                                     LogLevel.WARNING)
 
-        # 加载本地材料 JSON（如果有的话）
+        # Load local materials JSON if it exists
         json_path = os.path.join(data_dir, "local_materials.json")
         if os.path.exists(json_path):
             cnt = self._mat_lib.load_local_materials_from_json(json_path)
             self._logger.log_system(f"Loaded {cnt} local materials from JSON")
 
-        # 将材料库挂到项目树上
+        # Attach material library to the project tree
         self._project_tree.set_material_lib(self._mat_lib)
         self._project_tree.refresh_materials()
 
@@ -293,6 +295,19 @@ class MainWindow(QMainWindow):
             self._on_save_local_materials)
         self._project_tree.load_local_materials_requested.connect(
             self._on_load_local_materials)
+        self._project_tree.solid_preview_requested.connect(
+            self._on_solid_preview)
+        self._project_tree.delete_geometry_requested.connect(
+            self._on_delete_geometry)
+        self._project_tree.transform_requested.connect(
+            self._on_transform_requested)
+
+        # Set up placement override provider so scene can resolve overrides
+        # during placement accumulation.
+        if self._vtk_widget:
+            self._vtk_widget.set_override_provider(
+                lambda entry_id: self._gdml_agent.get_placement_override(entry_id)
+            )
 
         # NOTE: VTK picking signal is connected lazily when _get_vtk_window() is called.
 
@@ -319,7 +334,7 @@ class MainWindow(QMainWindow):
         self._rebuild_ui()
 
     def _on_export_gdml(self):
-        """Export GDML file"""
+        """Export GDML file with all placement overrides applied."""
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Export GDML", "",
             "GDML Files (*.gdml);;All Files (*)"
@@ -327,8 +342,21 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         self._logger.log_system(f"Exporting to: {file_path}")
-        # TODO: Implement export logic
-        self._logger.log_system("  [OK] Export complete")
+
+        try:
+            from core.gdml_writer import GdmlWriter
+            root = self._gdml_agent.get_root_node()
+            overrides = self._gdml_agent.get_all_placement_overrides()
+            writer = GdmlWriter()
+            writer.write(root, overrides, file_path)
+            self._logger.log_system("  [OK] Export complete")
+        except Exception as e:
+            self._logger.log_system(
+                f"  [ERR] Export failed: {e}",
+                level=LogLevel.ERROR)
+            QMessageBox.warning(
+                self, "Export Error",
+                f"Failed to export GDML:\n{e}")
 
     def _on_clear_all(self):
         """Clear all data"""
@@ -342,6 +370,7 @@ class MainWindow(QMainWindow):
             # Show default 3D view (grid + axes, no geometry)
             self._vtk_widget.get_scene().clear()
             self._vtk_widget._ensure_default_actors()
+            self._vtk_widget._update_cube_axes_bounds()
             self._vtk_widget.refresh()
             self._vtk_widget.setVisible(True)
             self._center_stack.setCurrentIndex(1)
@@ -412,7 +441,7 @@ class MainWindow(QMainWindow):
     # ==================== Material handlers ====================
 
     def _on_material_assignment(self):
-        """打开批量材料分配对话框。"""
+        """Open the batch material assignment dialog."""
         file_nodes = self._gdml_agent.get_all_file_nodes()
         if not file_nodes:
             QMessageBox.information(
@@ -425,10 +454,10 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_materials_saved(self, assigned: int, total: int):
-        """材料分配保存后重建 3D 场景（更新颜色）。"""
+        """Rebuild 3D scene after material assignment (update colors)."""
         self._logger.log_system(
             f"Materials assigned: {assigned}/{total} volumes have materials")
-        # 刷新 3D 场景（材料颜色变更）
+        # Refresh 3D scene (material colors changed)
         root = self._gdml_agent.get_root_node()
         if self._vtk_widget:
             self._vtk_widget.build_scene(root)
@@ -436,28 +465,46 @@ class MainWindow(QMainWindow):
             f"Materials: {assigned}/{total} assigned")
 
     def _on_add_local_material(self):
-        """打开添加局部材料对话框。"""
+        """Open local material dialog and auto-select the new material."""
+        from core.materials_lib import CustomElement
+
         dialog = LocalMaterialDialog(self._mat_lib, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._project_tree.populate_local_materials(self._mat_lib)
+            new_mat_id = dialog.last_mat_id
+            if new_mat_id:
+                self._project_tree.select_local_material(new_mat_id)
+                mat = self._mat_lib.get_local_material_by_id(new_mat_id)
+                if mat:
+                    self._property_panel.show_local_material_info(mat)
             self._logger.log_system(
                 f"Local material added. Total: "
                 f"{len(self._mat_lib.get_local_material_names())}")
 
-    def _on_remove_local_material(self, mat_name: str):
-        """删除局部材料。"""
-        # 按名称查找并删除
+    def _on_remove_local_material(self, display_name: str):
+        """Remove a local material by tree display name (matches cad2gdml)."""
+        from core.materials_lib import CustomElement
+
         for mat in self._mat_lib.get_all_local_materials():
-            name = getattr(mat, 'mat_name', getattr(mat, 'name', ''))
-            if name == mat_name:
-                mat_id = getattr(mat, 'mat_id', '')
-                if self._mat_lib.delete_material(mat_id):
-                    self._project_tree.populate_local_materials(self._mat_lib)
-                    self._logger.log_system(f"Deleted local material: {mat_name}")
-                return
+            # Custom elements: compare by symbol (matches tree display)
+            if isinstance(mat, CustomElement):
+                if mat.symbol == display_name:
+                    if self._mat_lib.delete_material(mat.mat_id):
+                        self._project_tree.populate_local_materials(self._mat_lib)
+                        self._logger.log_system(
+                            f"Deleted local material: {display_name}")
+                    return
+            else:
+                name = getattr(mat, 'mat_name', getattr(mat, 'name', ''))
+                if name == display_name:
+                    if self._mat_lib.delete_material(mat.mat_id):
+                        self._project_tree.populate_local_materials(self._mat_lib)
+                        self._logger.log_system(
+                            f"Deleted local material: {display_name}")
+                    return
 
     def _on_save_local_materials(self):
-        """保存局部材料到 JSON 文件。"""
+        """Save local materials to JSON file."""
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Local Materials", "",
             "JSON Files (*.json);;All Files (*)")
@@ -472,7 +519,7 @@ class MainWindow(QMainWindow):
                                     LogLevel.ERROR)
 
     def _on_load_local_materials(self):
-        """从 JSON 文件加载局部材料。"""
+        """Load local materials from JSON file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Load Local Materials", "",
             "JSON Files (*.json);;All Files (*)")
@@ -501,11 +548,16 @@ class MainWindow(QMainWindow):
         # ── Local material item clicked ──
         if entry_id.startswith("__local__:"):
             mat_id = entry_id[10:]
-            mat = self._get_local_material_by_id(mat_id)
+            mat = self._mat_lib.get_local_material_by_id(mat_id)
             if mat:
+                from core.materials_lib import CustomElement
                 self._property_panel.show_local_material_info(mat)
+                if isinstance(mat, CustomElement):
+                    display = mat.symbol
+                else:
+                    display = getattr(mat, 'mat_name', mat_id)
                 self._status_label.setText(
-                    f"Local Material: {getattr(mat, 'mat_name', mat_id)}")
+                    f"Local Material: {display}")
             else:
                 self._property_panel.show_node(None)
                 self._status_label.setText(f"Local material (id={mat_id}) not found")
@@ -524,13 +576,7 @@ class MainWindow(QMainWindow):
             self._property_panel.show_node(None)
             self._status_label.setText("No node selected")
 
-    def _get_local_material_by_id(self, mat_id: str):
-        """查找局部材料 by mat_id（匹配 cad2gdml 的 _get_local_material_by_id）。"""
-        for mat in self._mat_lib.get_all_local_materials():
-            mid = getattr(mat, 'mat_id', '')
-            if mid == mat_id:
-                return mat
-        return None
+
 
     def _on_visibility_changed(self, entry_id: str, visible: bool):
         """Visibility changed"""
@@ -538,6 +584,109 @@ class MainWindow(QMainWindow):
             scene = self._vtk_widget.get_scene()
             scene.set_visibility(entry_id, visible)
             self._vtk_widget.refresh()
+
+    def _on_solid_preview(self, entry_id: str):
+        """Preview a single solid in a VTK popup window."""
+        from ui.vtk_view_window import VtkViewWindow
+        from core.gdml_tree import GdmlNode, GdmlNodeType
+
+        # Find the SOLID_DEF node
+        node = self._gdml_agent.get_node_by_entry_id(entry_id)
+        if not node or node.node_type != GdmlNodeType.SOLID_DEF:
+            self._logger.log_system(
+                f"Cannot preview: solid not found (id={entry_id})",
+                LogLevel.WARNING)
+            return
+
+        # Create a minimal tree: ROOT -> GDML_FILE -> VOLUME (with solid's params)
+        temp_root = GdmlNode(GdmlNodeType.ROOT_NODE, "preview")
+        temp_file = GdmlNode(GdmlNodeType.GDML_FILE, "preview.gdml")
+        temp_vol = GdmlNode(GdmlNodeType.VOLUME_NODE, node.name)
+        if node.solid_params:
+            temp_vol.solid_params = dict(node.solid_params)
+        temp_vol.gdml_tag = node.gdml_tag
+        temp_vol.material_name = node.material_name or "G4_WATER"
+        temp_file.add_child(temp_vol)
+        temp_root.add_child(temp_file)
+
+        # Show in a preview window (minimal: no toolbar, transparent by default)
+        preview = VtkViewWindow(preview_mode=True)
+        preview.setWindowTitle(f"Solid Preview: {node.name}")
+        # Use build_scene instead of get_scene().build_from_tree so CubeAxes is preserved
+        preview.build_scene(temp_root, render_all_volumes=True)
+        preview.set_all_opacity(0.45)
+        preview.resize(600, 500)
+
+        # Hold a reference so the window isn't garbage-collected
+        if not hasattr(self, '_preview_windows'):
+            self._preview_windows = []
+        self._preview_windows.append(preview)
+        preview.destroyed.connect(
+            lambda: self._preview_windows.remove(preview)
+            if preview in self._preview_windows else None)
+        preview.show()
+
+    def _on_delete_geometry(self, entry_id: str):
+        """Delete a GDML file and rebuild the UI."""
+        self._gdml_agent.remove_file_node(entry_id)
+        self._rebuild_ui()
+
+    def _on_transform_requested(self, entry_id: str):
+        """Open TransformDialog for a volume instance or file node."""
+        node = self._gdml_agent.get_node_by_entry_id(entry_id)
+        if node is None:
+            self._logger.log_warning(
+                "Transform: cannot find node for entry: " + entry_id)
+            return
+
+        # Determine transform target: for VOLUME_NODE instances under a PHYVOL,
+        # the actual placement lives on the parent PHYVOL_NODE.
+        if (node.node_type == GdmlNodeType.VOLUME_NODE
+                and node.parent
+                and node.parent.node_type == GdmlNodeType.PHYVOL_NODE):
+            # Edit the parent physvol's placement
+            physvol = node.parent
+            target_entry_id = physvol.entry_id
+            # Show current (possibly overridden) value in the dialog
+            override = self._gdml_agent.get_placement_override(target_entry_id)
+            placement = override if override else (physvol.placement or Placement())
+            title = "Edit Physvol Transform"
+            target_label = "{} -> {}".format(physvol.name, physvol.ref_name)
+
+        elif node.node_type == GdmlNodeType.GDML_FILE:
+            # Edit file-level transform
+            target_entry_id = node.entry_id
+            placement = node.file_transform or Placement()
+            title = "Edit File Transform"
+            target_label = "File: " + (node.name if node.name else "unnamed")
+
+        elif node.node_type == GdmlNodeType.WORLD_NODE:
+            self._logger.log_info(
+                "World transform is not editable via this dialog.")
+            return
+        else:
+            self._logger.log_info(
+                "Transform is not applicable for this node type: "
+                + node.node_type.name)
+            return
+
+        dialog = TransformDialog(title, target_label, placement, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_placement = dialog.get_placement()
+            if node.node_type == GdmlNodeType.GDML_FILE:
+                # Apply file-level transform and refresh scene only
+                node.file_transform = Placement(
+                    x=new_placement.x, y=new_placement.y, z=new_placement.z,
+                    rot_x=new_placement.rot_x, rot_y=new_placement.rot_y,
+                    rot_z=new_placement.rot_z,
+                )
+            else:
+                # Apply placement override (lives in agent's _placement_overrides)
+                self._gdml_agent.set_placement_override(
+                    target_entry_id, new_placement)
+            # Rebuild only the scene (tree structure is unchanged)
+            root = self._gdml_agent.get_root_node()
+            self._vtk_widget.build_scene(root)
 
     def _on_node_picked(self, entry_id: str):
         """Node picked in 3D view"""

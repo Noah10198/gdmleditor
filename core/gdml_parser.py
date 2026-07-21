@@ -302,11 +302,11 @@ class GdmIParser:
         node.gdml_tag = "tessellated"
         node.gdml_attrs = dict(elem.attrib)
 
-        # Collect all vertices and triangles
-        vertices: Dict[str, Tuple[float, float, float]] = {}  # vertex_name -> position
+        # Collect triangles and quadrangles as vertex name references
         triangles: List[Tuple[str, str, str]] = []            # (v1, v2, v3) name refs
         quadrangles: List[Tuple[str, str, str, str]] = []     # (v1, v2, v3, v4)
 
+        vertex_names: set = set()
         for child in elem:
             if child.tag == "triangular":
                 v1 = child.get("vertex1", "")
@@ -314,6 +314,7 @@ class GdmIParser:
                 v3 = child.get("vertex3", "")
                 if v1 and v2 and v3:
                     triangles.append((v1, v2, v3))
+                    vertex_names.update((v1, v2, v3))
             elif child.tag == "quadrangular":
                 v1 = child.get("vertex1", "")
                 v2 = child.get("vertex2", "")
@@ -321,31 +322,66 @@ class GdmIParser:
                 v4 = child.get("vertex4", "")
                 if v1 and v2 and v3 and v4:
                     quadrangles.append((v1, v2, v3, v4))
+                    vertex_names.update((v1, v2, v3, v4))
+
+        # Resolve vertex coordinates from global positions
+        resolved_vertices: Dict[str, Tuple[float, float, float]] = {}
+        unresolved = False
+        for vn in vertex_names:
+            if vn in self._positions:
+                resolved_vertices[vn] = self._positions[vn]
+            else:
+                # Inline vertex might be defined inside tessellated element (GDML inline)
+                resolved_vertices[vn] = (0.0, 0.0, 0.0)
+                unresolved = True
+
+        # Resolve triangle face vertex indices
+        resolved_triangles: List[Tuple[int, int, int]] = []
+        for v1, v2, v3 in triangles:
+            if v1 in resolved_vertices and v2 in resolved_vertices and v3 in resolved_vertices:
+                resolved_triangles.append((v1, v2, v3))
+
+        # Resolve quadrangle face vertex indices
+        resolved_quadrangles: List[Tuple[int, int, int, int]] = []
+        for v1, v2, v3, v4 in quadrangles:
+            if all(v in resolved_vertices for v in (v1, v2, v3, v4)):
+                resolved_quadrangles.append((v1, v2, v3, v4))
 
         node.solid_params = {
             "tri_count": len(triangles),
             "quad_count": len(quadrangles),
+            "vertices": resolved_vertices,
+            "triangles": resolved_triangles,
+            "quadrangles": resolved_quadrangles,
         }
-
-        # Store vertex references and triangle references (resolved during VTK build)
-        node.gdml_attrs["_triangles"] = str(triangles)
-        node.gdml_attrs["_quadrangles"] = str(quadrangles)
 
         return node
 
     # ==================== <structure> parsing ====================
 
     def _parse_structure(self, structure_elem: ET.Element, parent_node: GdmlNode):
-        """Parse the <structure> section"""
+        """Parse the <structure> section.
+
+        Following Geant4's G4LogicalVolumeStore pattern:
+        - Each <volume> creates a LOGICAL VOLUME definition (VOLUME_NODE)
+        - Volumes are added as direct children of the file node (the "store")
+        - Physical placements (physvol -> volumeref) create instance clones
+          instead of reparenting the original, so the same volume can be
+          referenced by multiple physvols without conflict.
+        """
         for child in structure_elem:
             tag = child.tag
             if tag == "volume":
                 vol_node = self._parse_volume(child)
                 if vol_node:
+                    # Add volume as child of file node (LogicalVolumeStore),
+                    # following Geant4's G4LogicalVolumeStore pattern.
+                    # This keeps the definition separate from physical instances.
                     parent_node.add_child(vol_node)
             elif tag == "assembly":
                 asm_node = self._parse_assembly(child)
                 if asm_node:
+                    # Assemblies also go to the store
                     parent_node.add_child(asm_node)
 
     def _parse_volume(self, vol_elem: ET.Element) -> Optional[GdmlNode]:
@@ -394,11 +430,24 @@ class GdmIParser:
         return vol_node
 
     def _parse_physvol(self, phys_elem: ET.Element) -> Optional[GdmlNode]:
-        """Parse a <physvol> element"""
+        """Parse a <physvol> element
+
+        Following Geant4's G4PVPlacement pattern: each physvol creates a
+        new physical instance with its own transform. The instance is a
+        recursively cloned subtree (volume + nested physvols), so the
+        same logical volume can be placed multiple times independently.
+        """
         name = phys_elem.get("name", "")
         phys_node = GdmlNode(GdmlNodeType.PHYVOL_NODE, name)
         phys_node.gdml_attrs = dict(phys_elem.attrib)
         phys_node.placement = Placement()
+
+        # Discover referenced volume name to give unnamed physvol a meaningful name
+        ref_name = phys_elem.find("volumeref")
+        ref = ref_name.get("ref", "") if ref_name is not None else ""
+        if not name and ref:
+            phys_node.name = f"physvol -> {ref}"
+        phys_node.ref_name = ref
 
         for child in phys_elem:
             tag = child.tag
@@ -408,10 +457,15 @@ class GdmIParser:
                 phys_node.ref_name = ref
                 phys_node.gdml_attrs["volumeref"] = ref
 
-                # If referenced volume is already parsed, attach it as child
+                # Create an INSTANCE clone subtree, not a reference to the
+                # original volume (which stays in the LogicalVolumeStore).
+                # The clone recursively copies nested physvol hierarchy so
+                # multi-level placements (e.g., World -> lDetector -> lTes)
+                # are preserved independently per physvol.
                 if ref in self._volumes:
                     ref_vol = self._volumes[ref]
-                    phys_node.add_child(ref_vol)
+                    inst = self._clone_volume_instance(ref_vol)
+                    phys_node.add_child(inst)
 
             elif tag == "position":
                 unit = child.get("unit", "mm")
@@ -452,6 +506,48 @@ class GdmIParser:
                     phys_node.placement.rot_z = rot[2]
 
         return phys_node
+
+    def _clone_volume_instance(self, vol_node: GdmlNode) -> GdmlNode:
+        """Recursively clone a volume as a physical instance.
+
+        Analogous to Geant4 creating a G4PVPlacement: the clone gets its
+        own solid parameters and recursively clones nested physvol children,
+        but the original volume definition stays untouched in the store.
+        SOLID_DEF children are NOT cloned (they belong to the Solids group).
+        """
+        inst = GdmlNode(GdmlNodeType.VOLUME_NODE, vol_node.name)
+        inst.solid_params = dict(vol_node.solid_params) if vol_node.solid_params else None
+        inst.gdml_tag = vol_node.gdml_tag
+        inst.material_name = vol_node.material_name
+        inst.gdml_attrs = dict(vol_node.gdml_attrs)
+
+        # Recursively clone nested physvol children
+        for child in vol_node.children:
+            if child.node_type == GdmlNodeType.PHYVOL_NODE:
+                pv_clone = self._clone_physvol(child)
+                inst.add_child(pv_clone)
+
+        return inst
+
+    def _clone_physvol(self, pv_node: GdmlNode) -> GdmlNode:
+        """Clone a PHYVOL_NODE with its instance subtree."""
+        clone = GdmlNode(GdmlNodeType.PHYVOL_NODE, pv_node.name)
+        clone.ref_name = pv_node.ref_name
+        clone.gdml_attrs = dict(pv_node.gdml_attrs)
+        if pv_node.placement:
+            clone.placement = Placement(
+                x=pv_node.placement.x, y=pv_node.placement.y, z=pv_node.placement.z,
+                rot_x=pv_node.placement.rot_x, rot_y=pv_node.placement.rot_y,
+                rot_z=pv_node.placement.rot_z,
+                unit=pv_node.placement.unit, rot_unit=pv_node.placement.rot_unit,
+            )
+
+        for child in pv_node.children:
+            if child.node_type == GdmlNodeType.VOLUME_NODE:
+                inst_clone = self._clone_volume_instance(child)
+                clone.add_child(inst_clone)
+
+        return clone
 
     def _parse_assembly(self, asm_elem: ET.Element) -> Optional[GdmlNode]:
         """Parse an <assembly> element"""

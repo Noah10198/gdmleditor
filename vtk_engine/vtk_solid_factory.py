@@ -13,7 +13,7 @@ Following cad2gdml style, a single factory class manages all type creation.
 from typing import Dict, List, Tuple, Optional
 import math
 
-from vtkmodules.vtkCommonDataModel import vtkPolyData
+from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkTriangle, vtkCellArray
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkFiltersSources import (
     vtkCubeSource,
@@ -112,8 +112,10 @@ class VtkSolidFactory:
         actor = vtkActor()
         actor.SetMapper(mapper)
 
-        # Set color
-        color = self._get_color_for_material(node.material_name)
+        # Set color by volume identity (name or entry_id) — each physical body
+        # gets its own color independent of shared material names
+        color_key = node.entry_id if node.entry_id else node.name
+        color = self._get_color_for_node(color_key)
         actor.GetProperty().SetColor(*color)
 
         # ── Material properties for realistic shading ──
@@ -269,47 +271,87 @@ class VtkSolidFactory:
         return append.GetOutput()
 
     def _create_tessellated(self, node: GdmlNode) -> vtkPolyData:
-        """Create a tessellated solid"""
-        # Extract triangle mesh info from node attributes
-        # Note: tessellated vertices reference positions defined in <define> section
-        # We need to look up from parsed positions
-        # Simplified: extract triangle data from gdml_attrs
-
-        points = vtkPoints()
+        """Create tessellated solid from triangles/quadrangles vertex data."""
         poly_data = vtkPolyData()
+        points = vtkPoints()
+        polys = vtkCellArray()
 
-        # Build vertex list and triangles
-        # Get positions from <define>
-        # This requires access to parser's _positions via GdmlAgent
-        all_positions: Dict[str, Tuple[float, float, float]] = {}
-        # This will be passed in from external during actual use, empty for now
+        if not node.solid_params:
+            return poly_data
 
-        triangles_str = node.gdml_attrs.get("_triangles", "[]")
-        quadrangles_str = node.gdml_attrs.get("_quadrangles", "[]")
+        vertices: dict = node.solid_params.get("vertices", {})
+        triangles: list = node.solid_params.get("triangles", [])
+        quadrangles: list = node.solid_params.get("quadrangles", [])
 
-        # Simplified: MVP extracts vertices from gdml_attrs
-        # Should use _positions dict lookup in production
-        # Returns empty polydata, VtkScene will build with full context
+        if not vertices or (not triangles and not quadrangles):
+            return poly_data
+
+        # Build vertex name -> index map, insert points
+        vname_to_idx: Dict[str, int] = {}
+        for vname, coord in vertices.items():
+            vname_to_idx[vname] = points.InsertNextPoint(coord)
+
+        # Insert triangle faces
+        for v1_name, v2_name, v3_name in triangles:
+            tri = vtkTriangle()
+            tri.GetPointIds().SetId(0, vname_to_idx.get(v1_name, 0))
+            tri.GetPointIds().SetId(1, vname_to_idx.get(v2_name, 0))
+            tri.GetPointIds().SetId(2, vname_to_idx.get(v3_name, 0))
+            polys.InsertNextCell(tri)
+
+        # Insert quadrangles as two triangles each (for VTK rendering)
+        for v1_name, v2_name, v3_name, v4_name in quadrangles:
+            i1 = vname_to_idx.get(v1_name, 0)
+            i2 = vname_to_idx.get(v2_name, 0)
+            i3 = vname_to_idx.get(v3_name, 0)
+            i4 = vname_to_idx.get(v4_name, 0)
+
+            # Split quad into two triangles: (v1,v2,v3) and (v1,v3,v4)
+            tri1 = vtkTriangle()
+            tri1.GetPointIds().SetId(0, i1)
+            tri1.GetPointIds().SetId(1, i2)
+            tri1.GetPointIds().SetId(2, i3)
+            polys.InsertNextCell(tri1)
+
+            tri2 = vtkTriangle()
+            tri2.GetPointIds().SetId(0, i1)
+            tri2.GetPointIds().SetId(1, i3)
+            tri2.GetPointIds().SetId(2, i4)
+            polys.InsertNextCell(tri2)
+
+        poly_data.SetPoints(points)
+        poly_data.SetPolys(polys)
         return poly_data
 
-    def _get_color_for_material(self, material_name: str) -> Tuple[float, float, float]:
-        """Get color by material name"""
-        if not material_name:
-            return self._COLORS["default"]
+    @staticmethod
+    def _get_color_for_node(name: str) -> Tuple[float, float, float]:
+        """Generate a stable, visually distinct color from a node's name/ID.
+        Uses a curated palette of 20+ colors for the first nodes, then
+        falls back to a hash-based hue spread for uniqueness."""
+        curated = [
+            (0.50, 0.70, 0.90),  # soft blue
+            (0.90, 0.55, 0.30),  # orange
+            (0.55, 0.80, 0.55),  # green
+            (0.90, 0.65, 0.75),  # pink
+            (0.70, 0.55, 0.85),  # purple
+            (0.90, 0.80, 0.40),  # gold
+            (0.55, 0.80, 0.90),  # cyan
+            (0.85, 0.60, 0.50),  # salmon
+            (0.65, 0.75, 0.50),  # olive
+            (0.90, 0.70, 0.90),  # light magenta
+            (0.50, 0.60, 0.75),  # steel blue
+            (0.75, 0.50, 0.40),  # brown
+            (0.65, 0.80, 0.75),  # seafoam
+            (0.85, 0.60, 0.65),  # rose
+            (0.70, 0.70, 0.50),  # khaki
+            (0.55, 0.65, 0.85),  # cornflower
+            (0.85, 0.75, 0.55),  # tan
+            (0.65, 0.55, 0.75),  # lavender
+            (0.80, 0.65, 0.55),  # clay
+            (0.60, 0.75, 0.70),  # sage
+        ]
 
-        # Exact match
-        if material_name in self._COLORS:
-            return self._COLORS[material_name]
-
-        # Prefix match (e.g. G4_AIR, G4_Al ...)
-        for key, color in self._COLORS.items():
-            if material_name.startswith(key) or key.startswith(material_name):
-                return color
-
-        # Generate stable color from name hash
         import hashlib
-        h = hashlib.md5(material_name.encode()).hexdigest()
-        r = (int(h[0:2], 16) % 156 + 100) / 255.0
-        g = (int(h[2:4], 16) % 156 + 100) / 255.0
-        b = (int(h[4:6], 16) % 156 + 100) / 255.0
-        return (r, g, b)
+        h = hashlib.md5(name.encode()).hexdigest()
+        idx = int(h[:4], 16) % len(curated)
+        return curated[idx]

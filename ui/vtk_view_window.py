@@ -18,7 +18,7 @@ from typing import Optional
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from ui.vtk_widget import VtkWidget
+from ui.vtk_widget import VtkWidget, VtkPreviewWidget
 from vtk_engine.vtk_scene import VtkScene
 from core.gdml_tree import GdmlNode
 
@@ -28,16 +28,17 @@ class VtkViewWindow(QWidget):
     Stand-alone 3D view window.
 
     This is a plain QWidget shown as a top-level window (via WindowFlags).
-    It wraps VtkWidget and forwards API calls.
+    It wraps VtkWidget (or VtkPreviewWidget) and forwards API calls.
     Absolutely NO stylesheet is set — the dark background comes from VTK's
     renderer background colour, NOT from Qt styling.
     """
 
     node_picked = pyqtSignal(str)  # Forwarded from VtkWidget
 
-    def __init__(self):
+    def __init__(self, preview_mode: bool = False):
         super().__init__()
-        self._vtk_widget = VtkWidget(self)
+        widget_class = VtkPreviewWidget if preview_mode else VtkWidget
+        self._vtk_widget = widget_class(self)
         self._vtk_widget.setMinimumSize(100, 100)
 
         self.setWindowTitle("3D View")
@@ -73,9 +74,9 @@ class VtkViewWindow(QWidget):
     # Forwarded VtkWidget API
     # ------------------------------------------------------------------
 
-    def build_scene(self, root_node: GdmlNode):
+    def build_scene(self, root_node: GdmlNode, *, render_all_volumes: bool = False):
         """Build/rebuild the full scene from the GDML tree."""
-        self._vtk_widget.build_scene(root_node)
+        self._vtk_widget.build_scene(root_node, render_all_volumes=render_all_volumes)
 
     def get_scene(self) -> VtkScene:
         """Get the underlying VtkScene."""
@@ -88,6 +89,14 @@ class VtkViewWindow(QWidget):
     def set_dark_theme(self, dark: bool):
         """Switch between dark / light background."""
         self._vtk_widget.set_dark_theme(dark)
+
+    def set_all_opacity(self, opacity: float):
+        """Set opacity for all GDML actors (e.g. 0.45 for transparent preview)."""
+        for a in self._vtk_widget._gdml_actors:
+            p = a.GetProperty()
+            p.SetOpacity(opacity)
+            p.SetEdgeColor(0.5, 0.8, 0.9)
+        self.refresh()
 
     def cleanup(self):
         """Release VTK resources."""

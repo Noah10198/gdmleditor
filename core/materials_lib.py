@@ -1,12 +1,12 @@
 """
-MaterialsLib — 材料库管理器
+MaterialsLib -- Material library manager.
 
-提供三种材料来源：
-1. NIST 标准材料（G4_* 前缀，只读）
-2. 用户自定义元素
-3. 用户自定义化合物/混合物
+Provides three material sources:
+1. NIST standard materials (G4_* prefix, read-only)
+2. User-defined custom elements
+3. User-defined compounds / mixtures
 
-复用自 cad2gdml/core/materials_lib.py
+Reused from cad2gdml/core/materials_lib.py
 """
 
 from typing import Dict, List, Optional, Tuple, Any
@@ -14,20 +14,20 @@ import os
 import json
 
 
-# ============================ 材料类型枚举 ============================
+# ============================ Material Category Enum ============================
 
 class MatCategory:
-    """材料大类"""
-    CUSTOM = "custom"       # 自定义元素
-    COMPOUND = "compound"   # 化合物（原子数比例）
-    MIXTURE = "mixture"     # 混合物（质量比例）
-    NO_CATE = "no_cate"     # 未分类
+    """Material category enum."""
+    CUSTOM = "custom"       # Custom element
+    COMPOUND = "compound"   # Compound (atom count ratio)
+    MIXTURE = "mixture"     # Mixture (mass fraction)
+    NO_CATE = "no_cate"     # Uncategorized
 
 
-# ============================ 数据结构 ============================
+# ============================ Data Structures ============================
 
 class CompoundItem:
-    """化合物中的一种元素组分（原子数比例）"""
+    """One element component in a compound (atom count ratio)."""
     def __init__(self, symbol: str, atom_count: float):
         self.symbol = symbol
         self.atom_count = atom_count
@@ -41,7 +41,7 @@ class CompoundItem:
 
 
 class MixtureItem:
-    """混合物中的一种组分（质量比例）"""
+    """One component in a mixture (mass fraction)."""
     def __init__(self, symbol: str, mass_fraction: float):
         self.symbol = symbol
         self.mass_fraction = mass_fraction
@@ -55,7 +55,7 @@ class MixtureItem:
 
 
 class CustomElement:
-    """自定义元素材料"""
+    """Custom element material."""
     def __init__(self, mat_id: str, name: str, symbol: str, density: float,
                  atom_weight: float, atomic_number: float):
         self.mat_id = mat_id
@@ -80,7 +80,7 @@ class CustomElement:
 
 
 class CompoundMaterial:
-    """化合物材料（原子数比）"""
+    """Compound material (atom count ratio)."""
     def __init__(self, mat_id: str, mat_name: str, density: float,
                  components: List[CompoundItem]):
         self.mat_id = mat_id
@@ -103,7 +103,7 @@ class CompoundMaterial:
 
 
 class MixtureMaterial:
-    """混合物材料（质量比）"""
+    """Mixture material (mass fraction)."""
     def __init__(self, mat_id: str, mat_name: str, density: float,
                  components: List[MixtureItem]):
         self.mat_id = mat_id
@@ -125,20 +125,20 @@ class MixtureMaterial:
         return MixtureMaterial(d["mat_id"], d["mat_name"], d["density"], comps)
 
 
-# ============================ 材料库管理器 ============================
+# ============================ Material Library Manager ============================
 
 class MaterialsLib:
-    """单例风格的材料库管理器——管理 NIST 材料、自定义元素/化合物/混合物。"""
+    """Singleton-style material library manager -- manages NIST materials, custom elements, compounds, and mixtures."""
 
-    # 元素数据库：symbol -> (Z, atom_weight)
+    # Element database: symbol -> (Z, atom_weight)
     _ELEMENT_DB: Dict[str, Tuple[float, float]] = {}
 
-    GDML_OUTPUT_ENABLED = True  # 控制 GDML 输出开关
+    GDML_OUTPUT_ENABLED = True  # Toggle GDML output
 
     def __init__(self):
         self._nist_materials: Dict[str, Dict[str, Any]] = {}  # name -> info
-        self._nist_left_list: List[str] = []  # NIST 材料名列表
-        self._nist_right_list: List[str] = []  # 已选中的 NIST 材料
+        self._nist_left_list: List[str] = []  # NIST material names (available)
+        self._nist_right_list: List[str] = []  # NIST material names (selected)
 
         self._custom_elements: Dict[str, 'CustomElement'] = {}
         self._compounds: Dict[str, 'CompoundMaterial'] = {}
@@ -146,21 +146,25 @@ class MaterialsLib:
 
         self._counter_id = 0
 
-        # 初始化默认材料（与 cad2gdml 一致）
+        # Initialize default materials (matches cad2gdml)
         self._init_default_materials()
         self._init_default_local_materials()
 
-    # ========== ID 生成 ==========
+    # ========== ID Generation ==========
 
     def _next_id(self) -> str:
         self._counter_id += 1
         return f"mat_{self._counter_id}"
 
-    # ========== 元素数据 ==========
+    def generate_id(self) -> str:
+        """Generate a unique material ID (public wrapper for _next_id)."""
+        return self._next_id()
+
+    # ========== Element Data ==========
 
     @classmethod
     def load_elements_from_xml(cls, xml_path: str) -> int:
-        """从 element.xml 加载元素数据。"""
+        """Load element data from element.xml."""
         import xml.etree.ElementTree as ET
         count = 0
         cls._ELEMENT_DB.clear()
@@ -168,7 +172,8 @@ class MaterialsLib:
             tree = ET.parse(xml_path)
             root = tree.getroot()
             for elem in root.findall(".//element"):
-                symbol = elem.get("name", "").strip()
+                # Use 'formula' as symbol (e.g. "He"), NOT 'name' (e.g. "He_element")
+                symbol = elem.get("formula", "").strip()
                 z_str = elem.get("Z", "0").strip()
                 a_str = elem.get("a", "0").strip()
                 if symbol and z_str and a_str:
@@ -180,29 +185,29 @@ class MaterialsLib:
 
     @classmethod
     def get_atom_weight(cls, symbol: str) -> Optional[float]:
-        """获取元素的原子量。"""
+        """Get atomic weight for an element symbol."""
         entry = cls._ELEMENT_DB.get(symbol)
         return entry[1] if entry else None
 
     @classmethod
     def get_atomic_number(cls, symbol: str) -> Optional[float]:
-        """获取元素的原子序数。"""
+        """Get atomic number for an element symbol."""
         entry = cls._ELEMENT_DB.get(symbol)
         return entry[0] if entry else None
 
     @classmethod
     def get_all_elements(cls) -> Dict[str, Tuple[float, float]]:
-        """获取所有元素 symbol -> (Z, atom_weight)。"""
+        """Get all elements: symbol -> (Z, atom_weight)."""
         return dict(cls._ELEMENT_DB)
 
     @classmethod
     def element_exists(cls, symbol: str) -> bool:
         return symbol in cls._ELEMENT_DB
 
-    # ========== NIST 材料 ==========
+    # ========== NIST Materials ==========
 
     def load_nist_from_file(self, filepath: str) -> int:
-        """从 nist.txt 加载所有 G4_ 材料到 NIST 列表（与 cad2gdml 一致）。"""
+        """Load G4_ materials from nist.txt into NIST list (matches cad2gdml)."""
         count = 0
         loaded_names: List[str] = []
         self._nist_materials.clear()
@@ -220,10 +225,10 @@ class MaterialsLib:
             self._nist_left_list = loaded_names[:]
         return count
 
-    # ========== 默认材料（与 cad2gdml 一致） ==========
+    # ========== Default Materials (matches cad2gdml) ==========
 
     def _init_default_materials(self):
-        """初始化默认 NIST 材料（7 种常用材料作为 fallback）。"""
+        """Initialize default NIST materials (7 common materials as fallback)."""
         defaults = [
             ("G4_AIR", 0.001205, "Air (dry, near sea level)"),
             ("G4_Al", 2.699, "Aluminum"),
@@ -239,7 +244,7 @@ class MaterialsLib:
             self._nist_materials[name] = {"density": density}
 
     def _init_default_local_materials(self):
-        """添加默认局部材料（与 cad2gdml 一致）。"""
+        """Initialize default local materials (matches cad2gdml)."""
         # Default compound: water (H2O)
         water_compounds = [
             CompoundItem(symbol="H", atom_count=2),
@@ -279,7 +284,7 @@ class MaterialsLib:
     def is_nist_material(self, mat_name: str) -> bool:
         return mat_name in self._nist_materials
 
-    # ========== 自定义元素 ==========
+    # ========== Custom Elements ==========
 
     def add_custom_element(self, mat: CustomElement):
         self._custom_elements[mat.mat_id] = mat
@@ -296,7 +301,7 @@ class MaterialsLib:
             return True
         return False
 
-    # ========== 化合物 ==========
+    # ========== Compounds ==========
 
     def add_compound(self, mat: CompoundMaterial):
         self._compounds[mat.mat_id] = mat
@@ -313,7 +318,7 @@ class MaterialsLib:
             return True
         return False
 
-    # ========== 混合物 ==========
+    # ========== Mixtures ==========
 
     def add_mixture(self, mat: MixtureMaterial):
         self._mixtures[mat.mat_id] = mat
@@ -330,18 +335,28 @@ class MaterialsLib:
             return True
         return False
 
-    # ========== 通用方法 ==========
+    # ========== General Methods ==========
 
     def get_all_local_materials(self) -> List[Any]:
-        """获取所有用户自定义材料（用于树展示）。"""
+        """Get all user-defined local materials (for tree display)."""
         result: List[Any] = []
         result.extend(self._custom_elements.values())
         result.extend(self._compounds.values())
         result.extend(self._mixtures.values())
         return result
 
+    def get_local_material_by_id(self, mat_id: str) -> Optional[Any]:
+        """Look up a local material by mat_id across all material types."""
+        if mat_id in self._custom_elements:
+            return self._custom_elements[mat_id]
+        if mat_id in self._compounds:
+            return self._compounds[mat_id]
+        if mat_id in self._mixtures:
+            return self._mixtures[mat_id]
+        return None
+
     def get_local_material_names(self) -> List[str]:
-        """获取所有局部材料名称。"""
+        """Get all local material names."""
         names = []
         for ele in self._custom_elements.values():
             names.append(ele.name)
@@ -352,7 +367,7 @@ class MaterialsLib:
         return names
 
     def delete_material(self, mat_id: str) -> bool:
-        """尝试从所有分类中删除指定 ID 的材料。"""
+        """Try to delete a material by ID from all categories."""
         return (self.delete_custom_element(mat_id)
                 or self.delete_compound(mat_id)
                 or self.delete_mixture(mat_id))
@@ -362,11 +377,11 @@ class MaterialsLib:
         self._compounds.clear()
         self._mixtures.clear()
 
-    # ========== GDML 字符串生成 ==========
+    # ========== GDML String Generation ==========
 
     def to_gdml_string(self, mat_id: str, indent: str = "    ") -> str:
-        """将局部材料输出为 GDML <material> XML 字符串。"""
-        # 自定义元素
+        """Generate a GDML <material> XML string for a local material by ID."""
+        # Custom element
         elem = self._custom_elements.get(mat_id)
         if elem:
             formula = self._find_formula(elem.atom_weight)
@@ -377,7 +392,7 @@ class MaterialsLib:
                 f'{indent}</material>'
             )
 
-        # 化合物
+        # Compound
         comp = self._compounds.get(mat_id)
         if comp:
             lines = [
@@ -390,7 +405,7 @@ class MaterialsLib:
             lines.append(f'{indent}</material>')
             return "\n".join(lines)
 
-        # 混合物
+        # Mixture
         mix = self._mixtures.get(mat_id)
         if mix:
             lines = [
@@ -408,15 +423,15 @@ class MaterialsLib:
 
     @staticmethod
     def _find_formula(atom_weight: float) -> str:
-        """根据原子量推测简化式（仅作展示用）。"""
+        """Guess simplified formula based on atomic weight (display only)."""
         if abs(atom_weight - 1.00794) < 0.01:
             return "1"
         return "1.0"
 
-    # ========== JSON 序列化 ==========
+    # ========== JSON Serialization ==========
 
     def save_local_materials_to_json(self, filepath: str) -> bool:
-        """保存所有局部材料到 JSON 文件。"""
+        """Save all local materials to a JSON file."""
         try:
             data = {
                 "custom_elements": [e.to_dict() for e in self._custom_elements.values()],
@@ -430,7 +445,7 @@ class MaterialsLib:
             return False
 
     def load_local_materials_from_json(self, filepath: str) -> int:
-        """从 JSON 文件加载局部材料。返回加载的数量。"""
+        """Load local materials from a JSON file. Returns count of loaded items."""
         count = 0
         try:
             with open(filepath, "r", encoding="utf-8") as f:

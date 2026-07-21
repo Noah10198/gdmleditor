@@ -32,6 +32,9 @@ class ProjectTreeWidget(QWidget):
 
     node_selected = pyqtSignal(str)       # Node selected, emits entry_id
     visibility_changed = pyqtSignal(str, bool)  # Visibility changed
+    solid_preview_requested = pyqtSignal(str)   # Right-click solid -> preview in 3D
+    delete_geometry_requested = pyqtSignal(str) # Delete GDML file by entry_id
+    transform_requested = pyqtSignal(str)       # Right-click volume/file -> edit transform
 
     # Material signals (matches cad2gdml)
     assign_material_requested = pyqtSignal()
@@ -159,14 +162,19 @@ class ProjectTreeWidget(QWidget):
 
     def populate_local_materials(self, mat_lib: Optional[MaterialsLib] = None):
         """Populate the Local Materials tree node (matches cad2gdml)."""
+        from core.materials_lib import CustomElement
         lib = mat_lib or self._mat_lib
         if lib is None:
             return
         self._local_mat_root.takeChildren()
         for mat in lib.get_all_local_materials():
-            name = getattr(mat, 'mat_name',
-                           getattr(mat, 'name', 'unnamed'))
-            mat_id = getattr(mat, 'mat_id', getattr(mat, 'mat_id', ''))
+            # Custom element: display symbol only (matches cad2gdml)
+            if isinstance(mat, CustomElement):
+                name = mat.symbol
+            else:
+                name = getattr(mat, 'mat_name',
+                               getattr(mat, 'name', 'unnamed'))
+            mat_id = getattr(mat, 'mat_id', '')
             item = QTreeWidgetItem(self._local_mat_root, [name])
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             item.setData(0, Qt.ItemDataRole.UserRole, f"__local__:{mat_id}")
@@ -208,6 +216,44 @@ class ProjectTreeWidget(QWidget):
                 self.remove_local_material_requested.emit(mat_name)
             return
 
+        # Solid under Solids group: preview in 3D
+        node_type_val = item.data(0, TREE_NODE_TYPE_ROLE)
+        if node_type_val == GdmlNodeType.SOLID_DEF.value:
+            menu = QMenu(self)
+            preview_act = menu.addAction("🔍 Preview in 3D")
+            action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            if action == preview_act:
+                entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
+                if entry_id:
+                    self.solid_preview_requested.emit(entry_id)
+            return
+
+        # GDML file node: delete + file-level transform
+        if node_type_val == GdmlNodeType.GDML_FILE.value:
+            menu = QMenu(self)
+            edit_act = menu.addAction("Edit Transform...")
+            menu.addSeparator()
+            del_act = menu.addAction("❌ Delete File")
+            action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
+            if entry_id:
+                if action == edit_act:
+                    self.transform_requested.emit(entry_id)
+                elif action == del_act:
+                    self.delete_geometry_requested.emit(entry_id)
+            return
+
+        # Volume instance under World: edit physvol placement
+        if node_type_val == GdmlNodeType.VOLUME_NODE.value:
+            menu = QMenu(self)
+            edit_act = menu.addAction("Edit Transform...")
+            action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            if action == edit_act:
+                entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
+                if entry_id:
+                    self.transform_requested.emit(entry_id)
+            return
+
     # ==================== Geometry Tree ====================
 
     def clear_tree(self):
@@ -217,10 +263,16 @@ class ProjectTreeWidget(QWidget):
 
     def build_from_node_tree(self, root_node: GdmlNode):
         """
-        Build QTreeWidget from GdmlNode tree — clean display, no type prefixes.
+        Build QTreeWidget from GdmlNode tree.
 
-        Args:
-            root_node: GdmlNode root node
+        Structure:
+          filename.gdml
+            +-- Solids (all solid definitions, no checkbox)
+            |   +-- solid1
+            |   +-- ...
+            +-- World (volume hierarchy, no SOLID_DEF children)
+                +-- world_vol
+                    +-- ...
         """
         self.clear_tree()
 
@@ -229,21 +281,67 @@ class ProjectTreeWidget(QWidget):
                 continue
             file_item = self._create_tree_item(file_node)
             self._geometry_root.addChild(file_item)
-            self._build_recursive(file_item, file_node)
+            self._build_file_tree(file_item, file_node)
 
         self._geometry_root.setExpanded(True)
 
-    def _build_recursive(self, parent_item: QTreeWidgetItem, node: GdmlNode):
-        """Recursively build child nodes."""
+    def _build_file_tree(self, file_item: QTreeWidgetItem, file_node: GdmlNode):
+        """Build Solids + World groups under a file node."""
+        # Collect all SOLID_DEF nodes from the entire subtree
+        solid_nodes: List[GdmlNode] = []
+        self._collect_solid_nodes(file_node, solid_nodes)
+
+        # Create "Solids" group (only if there are solids)
+        if solid_nodes:
+            solids_item = QTreeWidgetItem(file_item, ["Solids"])
+            solids_item.setFlags(solids_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+            for solid_node in solid_nodes:
+                solid_item = self._create_tree_item(solid_node)
+                # No checkbox for solids (info-only nodes)
+                solid_item.setFlags(solid_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                solids_item.addChild(solid_item)
+
+        # Create "World" group — only show the physical hierarchy starting from
+        # WORLD_NODE. Other VOLUME_NODEs under file_node are logical definitions
+        # (Geant4 LogicalVolumeStore) and are not shown in the hierarchy.
+        world_node = next(
+            (c for c in file_node.children if c.node_type == GdmlNodeType.WORLD_NODE),
+            None
+        )
+        if world_node:
+            world_item = QTreeWidgetItem(file_item, ["World"])
+            world_item.setFlags(world_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            self._build_world_tree(world_item, world_node)
+
+    @staticmethod
+    def _collect_solid_nodes(node: GdmlNode, result: List[GdmlNode]):
+        """Recursively collect all SOLID_DEF nodes (avoid duplicates)."""
+        if node.node_type == GdmlNodeType.SOLID_DEF and node not in result:
+            result.append(node)
         for child in node.children:
-            child_item = self._create_tree_item(child)
-            parent_item.addChild(child_item)
-            self._build_recursive(child_item, child)
+            ProjectTreeWidget._collect_solid_nodes(child, result)
+
+    def _build_world_tree(self, parent_item: QTreeWidgetItem, node: GdmlNode):
+        """Build world hierarchy — show only logical physical bodies.
+
+        - SOLID_DEF: skipped (shown in "Solids" group only)
+        - PHYVOL_NODE: skipped (wrapper node; its instance children appear
+          directly under the parent, showing the clean physical hierarchy)
+        - instance VOLUME_NODE: shown as a direct child of its logical parent
+        """
+        if node.node_type in (GdmlNodeType.SOLID_DEF, GdmlNodeType.PHYVOL_NODE):
+            for child in node.children:
+                self._build_world_tree(parent_item, child)
+            return
+        child_item = self._create_tree_item(node)
+        parent_item.addChild(child_item)
+        for child in node.children:
+            self._build_world_tree(child_item, child)
 
     def _create_tree_item(self, node: GdmlNode) -> QTreeWidgetItem:
         """Create tree item from node — clean name, no type prefix."""
         item = QTreeWidgetItem()
-        # Clean display name: just the name, no [File] [Vol] etc.
         display_name = node.name if node.name else "(unnamed)"
         item.setText(0, display_name)
         item.setData(0, TREE_ITEM_DATA_ROLE, node.entry_id)
@@ -264,8 +362,18 @@ class ProjectTreeWidget(QWidget):
                  f"Material: {node.material_name}",
                  f"Entry ID: {node.entry_id}"]
         if node.solid_params:
-            params_str = ", ".join(f"{k}={v:.2f}" for k, v in node.solid_params.items())
-            lines.append(f"Params: {params_str}")
+            parts = []
+            for k, v in node.solid_params.items():
+                if isinstance(v, (int, float)):
+                    parts.append(f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}")
+                elif isinstance(v, str):
+                    parts.append(f"{k}={v}")
+                elif isinstance(v, dict):
+                    parts.append(f"{k}={len(v)} items")
+                elif isinstance(v, (list, tuple)):
+                    parts.append(f"{k}={len(v)} items")
+            if parts:
+                lines.append(f"Params: {', '.join(parts)}")
         if node.placement:
             p = node.placement
             lines.append(f"Position: ({p.x:.2f}, {p.y:.2f}, {p.z:.2f})")
@@ -343,7 +451,7 @@ class ProjectTreeWidget(QWidget):
         return nt in (6, 9)
 
     def select_item_by_entry_id(self, entry_id: str):
-        """Select tree item by entry_id."""
+        """Select tree item by entry_id (geometry nodes)."""
         item = self._find_item_by_entry_id(self._tree.invisibleRootItem(), entry_id)
         if item:
             self._tree.setCurrentItem(item)
@@ -352,6 +460,16 @@ class ProjectTreeWidget(QWidget):
             while p:
                 p.setExpanded(True)
                 p = p.parent()
+
+    def select_local_material(self, mat_id: str):
+        """Select a local material item by its mat_id."""
+        target_data = f"__local__:{mat_id}"
+        for i in range(self._local_mat_root.childCount()):
+            child = self._local_mat_root.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) == target_data:
+                self._tree.setCurrentItem(child)
+                self._local_mat_root.setExpanded(True)
+                return
 
     def _find_item_by_entry_id(self, parent: QTreeWidgetItem, entry_id: str) -> Optional[QTreeWidgetItem]:
         """Recursively search for item with given entry_id."""
