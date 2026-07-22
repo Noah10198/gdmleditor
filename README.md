@@ -17,7 +17,6 @@ gdmleditor is a **PyQt6 + VTK** based [GDML](https://geant4.web.cern.ch/support/
 - **View controls** — X/Y/Z axis views, orthographic/perspective toggle, Fit All
 - **Clipping plane** — Real-time X/Y/Z axis clipping with slider position control
 - **Visual effects** — Edge lines toggle, transparency toggle, dark/light themes
-- **GPU diagnostics** — Auto-detect OpenGL vendor/device/version/GLSL on startup; graceful fallback to software rendering if no GPU driver is available
 
 ### Supported Solid Types
 
@@ -118,15 +117,7 @@ python main.py
 1. **Instance cloning (Geant4 pattern)** — Each `<physvol>` creates a recursively cloned subtree; the source volume definition stays in the logical volume store
 2. **Edit overlay layer** — All user edits stored as non-destructive overlays; original parse tree untouched
 3. **Background threading** — Files >500KB parsed in `QThread` with marquee progress dialog
-4. **GPU auto-detection** — On-screen GPU rendering with off-screen software fallback; OCC-style console output
-5. **Lossless round-trip** — Unsupported solids preserved as raw XML for perfect export fidelity
-
-## Performance Notes
-
-- **Bottleneck**: Rendering very large numbers of independent physvols (e.g. 20k+) is CPU-bound on draw call submissions, not GPU fill-rate
-- **Large file test**: A 4.5MB / 102k-line / ~20k-physvol file loads correctly; interactive frame rate is limited
-- **Optimization path**: Actor merging (same-type solids → single PolyData) and instanced rendering (`vtkInstancedMapper`)
-- See `docs/04_performance_analysis.md` for details
+4. **Lossless round-trip** — Unsupported solids preserved as raw XML for perfect export fidelity
 
 ## License
 
