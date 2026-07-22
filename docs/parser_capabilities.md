@@ -1,7 +1,7 @@
 # GDML Parser / Writer Capabilities
 
 > Based on analysis against Geant4 official examples under `Ref/gdmlexample/` and `Ref/GDML-Main/SampleFiles/`.
-> Current as of 2026-07-21.
+> Current as of 2026-07-22.
 
 ---
 
@@ -117,8 +117,9 @@
 ## Summary
 
 ### Fully functional (parse + export + visualize):
-- **8 solid types:** box, sphere, orb, tube, tubs, cone, torus, ellipsoid, tessellated
+- **9 solid types:** box, sphere, orb, tube, tubs, cone, torus, ellipsoid, tessellated
 - polycone: VTK approximate (stacked cylindrical sections)
+- **Unsupported type detection:** importing solids outside the supported set triggers a `QMessageBox` warning with a detailed list. See `GdmlAgent.get_unsupported_solids()`.
 - Standard volume-physvol chain with positionref/rotationref
 - **Assembly** — full round-trip with physvol references
 - Standard materials (element + atom, material + composite/fraction + D)

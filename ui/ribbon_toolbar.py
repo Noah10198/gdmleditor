@@ -5,7 +5,7 @@ Based on cad2gdml's toolbar.py design, provides emoji-icon Ribbon toolbar.
 Buttons: Import GDML, Reset View, Export, Clear All, Redefine World, Dark/Light toggle, Help
 """
 
-from PyQt6.QtWidgets import QWidget, QHBoxLayout, QToolButton, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QHBoxLayout, QToolButton, QSizePolicy, QFrame
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
 
@@ -48,6 +48,7 @@ class RibbonToolBar(QWidget):
     export_clicked = pyqtSignal()
     clear_clicked = pyqtSignal()
     material_clicked = pyqtSignal()
+    interference_clicked = pyqtSignal()
     theme_toggled = pyqtSignal()
     help_clicked = pyqtSignal()
 
@@ -67,14 +68,30 @@ class RibbonToolBar(QWidget):
         # Define buttons: (emoji, label, signal)
         buttons = [
             ("📂", "Import GDML", self.import_clicked),
-            ("🎯", "Reset View", self.reset_view_clicked),
+            ("🔌", "Interference", self.interference_clicked),
+            ("🧪", "Material", self.material_clicked),
             ("📐", "Redefine World", self.redefine_world_clicked),
             ("💾", "Export GDML", self.export_clicked),
-            ("🧪", "Material", self.material_clicked),
-            ("🗑️", "Clear All", self.clear_clicked),
         ]
 
         for emoji, label, signal in buttons:
+            btn = _ribbon_button(emoji, label)
+            btn.clicked.connect(signal.emit)
+            layout.addWidget(btn)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setFixedWidth(3)
+        layout.addWidget(sep)
+
+        # Right-side buttons after separator
+        right_buttons = [
+            ("🎯", "Reset View", self.reset_view_clicked),
+            ("🗑️", "Clear All", self.clear_clicked),
+        ]
+        for emoji, label, signal in right_buttons:
             btn = _ribbon_button(emoji, label)
             btn.clicked.connect(signal.emit)
             layout.addWidget(btn)

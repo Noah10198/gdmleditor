@@ -27,6 +27,7 @@ from vtkmodules.vtkRenderingCore import (
 )
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkCommonCore import vtkCommand
+from vtkmodules.vtkCommonDataModel import vtkPolyData
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 from vtkmodules.vtkFiltersSources import vtkCubeSource
@@ -55,6 +56,7 @@ class VtkScene:
         # Selected entry_id
         self._selected_id: Optional[str] = None
         self._selected_actor: Optional[vtkActor] = None
+        self._highlighted_ids: set = set()
 
         # Placement override provider: callable(entry_id) -> Optional[Placement]
         # Used by GdmlAgent to override physvol placements from the edit overlay
@@ -170,6 +172,113 @@ class VtkScene:
         self._selected_actor = None
 
     # ==================== Selection & Highlight ====================
+
+    def get_world_polydata(self, entry_id: str):
+        """Get world-space transformed polydata for mesh-level checks.
+
+        Returns a deep copy of the actor's polydata with position+orientation
+        baked in, or None if the entry has no actor.
+        """
+        actor = self._actor_map.get(entry_id)
+        if actor is None:
+            return None
+
+        poly = vtkPolyData.SafeDownCast(
+            actor.GetMapper().GetInputAsDataSet()
+        )
+        if poly is None:
+            return None
+
+        pos = actor.GetPosition()
+        ori = actor.GetOrientation()
+        t = vtkTransform()
+        t.Translate(pos)
+        t.RotateZ(ori[2])
+        t.RotateX(ori[1])
+        t.RotateY(ori[0])
+        tpd = vtkTransformPolyDataFilter()
+        tpd.SetInputData(poly)
+        tpd.SetTransform(t)
+        tpd.Update()
+        return tpd.GetOutput()
+
+    def highlight_intersection(self, entry_a: str, entry_b: str,
+                               color=(1.0, 0.0, 0.0)):
+        """Compute and highlight the mesh intersection of two volumes.
+
+        Adds the intersection mesh to the scene as a semi-transparent red actor.
+        Returns the intersection mesh polydata.
+        """
+        poly_a = self.get_world_polydata(entry_a)
+        poly_b = self.get_world_polydata(entry_b)
+        if poly_a is None or poly_b is None:
+            return None
+
+        from vtkmodules.vtkFiltersModeling import vtkIntersectionPolyDataFilter
+        intersect = vtkIntersectionPolyDataFilter()
+        intersect.SetInputData(0, poly_a)
+        intersect.SetInputData(1, poly_b)
+        intersect.Update()
+        result = intersect.GetOutput()
+        if result.GetNumberOfPoints() == 0:
+            return None
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(result)
+        mapper.ScalarVisibilityOff()
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetOpacity(0.6)
+        self._renderer.AddActor(actor)
+
+        # Store for cleanup
+        if not hasattr(self, '_intersection_actors'):
+            self._intersection_actors = []
+        self._intersection_actors.append(actor)
+
+        self._renderer.ResetCameraClippingRange()
+        return result
+
+    def clear_intersections(self):
+        """Remove intersection overlay actors from scene."""
+        for a in getattr(self, '_intersection_actors', []):
+            self._renderer.RemoveActor(a)
+        self._intersection_actors = []
+
+    def highlight_volumes(self, entry_ids: List[str],
+                          color: Tuple[float, float, float] = (1.0, 0.2, 0.2)):
+        """Highlight specific volumes with colored edges (for interference display).
+
+        Args:
+            entry_ids: list of entry_id to highlight
+            color: RGB tuple, default red (1.0, 0.2, 0.2)
+        """
+        # Clear previous highlights
+        self.clear_highlights()
+
+        for eid in entry_ids:
+            actor = self._actor_map.get(eid)
+            if actor is None:
+                continue
+            self._highlighted_ids.add(eid)
+            actor.GetProperty().SetEdgeColor(*color)
+            actor.GetProperty().SetEdgeVisibility(True)
+            actor.GetProperty().SetLineWidth(4.0)
+
+    def clear_highlights(self):
+        """Clear interference highlights (restore selection if any)."""
+        for eid in self._highlighted_ids:
+            actor = self._actor_map.get(eid)
+            if actor is None:
+                continue
+            actor.GetProperty().SetEdgeVisibility(False)
+        self._highlighted_ids.clear()
+        # Re-apply normal selection highlight if something was selected
+        if self._selected_actor:
+            self._selected_actor.GetProperty().SetEdgeVisibility(True)
+            self._selected_actor.GetProperty().SetEdgeColor(1.0, 0.8, 0.0)
+            self._selected_actor.GetProperty().SetLineWidth(3.0)
 
     def select_node(self, entry_id: str):
         """Select node (highlight)"""

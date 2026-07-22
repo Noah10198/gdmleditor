@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QHBoxLayout, QStatusBar, QLabel, QDialog,
     QStackedWidget, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QPalette, QColor, QFont
 
 from core.gdml_agent import GdmlAgent
@@ -32,8 +32,38 @@ from ui.vtk_widget import VtkWidget
 from ui.redefine_world_dialog import RedefineWorldDialog
 from ui.assign_material_dialog import AssignMaterialDialog
 from ui.local_material_dialog import LocalMaterialDialog
+from ui.interference_panel import InterferencePanel
 from ui.transform_dialog import TransformDialog
 from core.gdml_tree import Placement
+
+
+class _ImportWorker(QObject):
+    """Parses GDML files in a background thread so the UI doesn't freeze."""
+
+    # Emitted per-file: (filepath, success, msg, file_node_or_None)
+    file_parsed = pyqtSignal(object, bool, str, object)
+    # Emitted when all files are done
+    all_done = pyqtSignal()
+
+    def __init__(self, agent: 'GdmlAgent', file_paths: list):
+        super().__init__()
+        self._agent = agent
+        self._file_paths = file_paths
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for filepath in self._file_paths:
+            if self._stop:
+                break
+            file_node, msg = self._agent.parse_file_only(filepath)
+            if file_node is not None:
+                self.file_parsed.emit(filepath, True, msg, file_node)
+            else:
+                self.file_parsed.emit(filepath, False, msg, None)
+        self.all_done.emit()
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +80,10 @@ class MainWindow(QMainWindow):
 
         self._vtk_widget: Optional[VtkWidget] = None
 
+        # Background import tracking
+        self._import_thread: Optional[QThread] = None
+        self._import_worker: Optional[_ImportWorker] = None
+
         # Build UI (create all widgets first, then apply theme)
         self._init_toolbar()
         self._init_project_tree()
@@ -57,6 +91,7 @@ class MainWindow(QMainWindow):
         self._init_vtk_widget()           # ← embedded VTK, pre-created
         self._init_property_panel()
         self._init_log_panel()
+        self._init_interference_panel()
         self._init_layout()
         self._init_status_bar()
 
@@ -239,6 +274,14 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._prop_dock)
         self.resizeDocks([self._prop_dock], [280], Qt.Orientation.Horizontal)
 
+    def _init_interference_panel(self):
+        """Initialize interference detection panel (hidden by default)"""
+        self._interference_panel = InterferencePanel(self._gdml_agent)
+        self._interference_panel.setObjectName("InterferencePanel")
+        self._interference_panel.highlight_requested.connect(
+            self._on_interference_highlight)
+        # Not added to dock area yet — shown on demand
+
     def _init_log_panel(self):
         """Initialize log panel (bottom)"""
         self._log_widget = QTextEdit()
@@ -277,6 +320,7 @@ class MainWindow(QMainWindow):
         # Ribbon toolbar
         self._toolbar.import_clicked.connect(self._on_import_gdml)
         self._toolbar.reset_view_clicked.connect(self._on_reset_view)
+        self._toolbar.interference_clicked.connect(self._on_interference)
         self._toolbar.export_clicked.connect(self._on_export_gdml)
         self._toolbar.clear_clicked.connect(self._on_clear_all)
         self._toolbar.redefine_world_clicked.connect(self._on_redefine_world)
@@ -314,7 +358,16 @@ class MainWindow(QMainWindow):
     # ==================== Signal handlers ====================
 
     def _on_import_gdml(self):
-        """Import GDML file"""
+        """Import GDML file (non-blocking, background parsing)"""
+        # Guard against concurrent imports
+        if self._import_thread and self._import_thread.isRunning():
+            QMessageBox.information(
+                self, "Import in Progress",
+                "A file import is already in progress. "
+                "Please wait for it to finish before importing another file."
+            )
+            return
+
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, "Import GDML Files", "",
             "GDML Files (*.gdml);;XML Files (*.xml);;All Files (*)"
@@ -322,6 +375,16 @@ class MainWindow(QMainWindow):
         if not file_paths:
             return
 
+        # If only one small file, load synchronously (faster, no thread overhead)
+        if len(file_paths) == 1 and os.path.getsize(file_paths[0]) < 500_000:
+            self._load_files_sync(file_paths)
+            return
+
+        # Use background thread for large files
+        self._load_files_async(file_paths)
+
+    def _load_files_sync(self, file_paths: list):
+        """Synchronous load for small files (no thread overhead)."""
         for filepath in file_paths:
             self._logger.log_system(f"Loading: {filepath}")
             success, msg = self._gdml_agent.load_gdml_file(filepath)
@@ -332,6 +395,117 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Import Error", f"Failed to import:\n{msg}")
 
         self._rebuild_ui()
+        self._check_unsupported_solids()
+
+    def _load_files_async(self, file_paths: list):
+        """Background-thread load for large files."""
+        self._logger.log_system(f"Loading {len(file_paths)} file(s) in background...")
+
+        # Show a modal "please wait" dialog (marquee style, no cancel to avoid
+        # partial-import state — the thread is fast enough to not need cancel)
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog(
+            "Parsing GDML file(s)...\nThis may take a moment for large files.",
+            None, 0, 0, self  # no cancel button, marquee mode
+        )
+        progress.setWindowTitle("Importing")
+        progress.setModal(True)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        # Create worker + thread
+        self._import_worker = _ImportWorker(self._gdml_agent, file_paths)
+        self._import_thread = QThread(self)
+        self._import_worker.moveToThread(self._import_thread)
+
+        self._import_thread.started.connect(self._import_worker.run)
+        self._import_worker.file_parsed.connect(self._on_file_parsed)
+        self._import_worker.all_done.connect(
+            lambda: self._on_import_all_done(progress))
+        self._import_thread.finished.connect(self._import_worker.deleteLater)
+        self._import_thread.finished.connect(self._import_thread.deleteLater)
+
+        self._import_thread.start()
+
+    def _on_file_parsed(self, filepath: str, success: bool, msg: str,
+                        file_node: object):
+        """Called on main thread when one file finishes parsing."""
+        if success and file_node is not None:
+            self._gdml_agent.add_parsed_file_node(file_node)
+            self._logger.log_system(f"  [OK] {msg}")
+        elif not success:
+            self._logger.log_system(f"  [ERR] {msg}", LogLevel.ERROR)
+            QMessageBox.warning(self, "Import Error",
+                                f"Failed to import:\n{msg}")
+
+    def _on_import_all_done(self, progress_dialog):
+        """Called on main thread when ALL files are parsed."""
+        progress_dialog.close()
+
+        # Clean up thread references
+        if self._import_thread:
+            self._import_thread.quit()
+            self._import_thread.wait()
+        self._import_thread = None
+        self._import_worker = None
+
+        self._logger.log_system("All files parsed, building UI...")
+        QApplication.processEvents()
+
+        self._rebuild_ui()
+        self._check_unsupported_solids()
+
+    def _check_unsupported_solids(self):
+        """Show warning about unparseable solid types."""
+        unsupported = self._gdml_agent.get_unsupported_solids()
+        if not unsupported:
+            return
+
+        from collections import Counter
+        tag_counts = Counter(s["tag"] for s in unsupported)
+        detail_lines = []
+        for tag, count in tag_counts.most_common():
+            names = [s["name"] for s in unsupported if s["tag"] == tag]
+            detail_lines.append(f"  • {tag} ({count}): {', '.join(names)}")
+
+        warning_msg = (
+            "The following solid types were found but cannot be fully parsed:\n\n"
+            + "\n".join(detail_lines) + "\n\n"
+            "These solids will be preserved for GDML export but will NOT "
+            "be rendered in the 3D view."
+        )
+        QMessageBox.warning(self, "Incomplete Geometry Parsing", warning_msg)
+
+    def _on_interference(self):
+        """Show interference detection dialog."""
+        # Set up override provider and scene (same as VTK)
+        self._interference_panel.set_override_provider(
+            lambda entry_id: self._gdml_agent.get_placement_override(entry_id)
+        )
+        if self._vtk_widget:
+            self._interference_panel.set_vtk_scene(
+                self._vtk_widget.get_scene()
+            )
+
+        # Refresh tree with current volumes
+        self._interference_panel._populate_tree()
+
+        self._interference_panel.show()
+        self._interference_panel.raise_()
+        self._interference_panel.activateWindow()
+
+    def _on_interference_highlight(self, entry_id_a: str, entry_id_b: str):
+        """Highlight colliding volumes in 3D scene."""
+        if not self._vtk_widget:
+            return
+        scene = self._vtk_widget.get_scene()
+        # Highlight single volume if only one provided
+        if entry_id_b:
+            scene.highlight_volumes([entry_id_a, entry_id_b])
+        elif entry_id_a:
+            scene.highlight_volumes([entry_id_a])
+        self._vtk_widget.refresh()
 
     def _on_export_gdml(self):
         """Export GDML file with all placement overrides applied."""
@@ -725,6 +899,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Cleanup on exit"""
+        # Gracefully shut down background import if running
+        if self._import_worker:
+            self._import_worker.stop()
+        if self._import_thread and self._import_thread.isRunning():
+            self._import_thread.quit()
+            self._import_thread.wait(2000)
         if self._vtk_widget:
             self._vtk_widget.cleanup()
         super().closeEvent(event)

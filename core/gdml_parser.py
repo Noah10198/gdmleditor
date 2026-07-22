@@ -50,6 +50,17 @@ class GdmIParser:
         "": 1.0,
     }
 
+    # Fully supported solid tags (parsed with solid_params for 3D rendering)
+    _SUPPORTED_SOLIDS = frozenset({
+        "box", "sphere", "orb",
+        "tube", "tubs",
+        "cone",
+        "tessellated",
+        "torus",
+        "ellipsoid",
+        "polycone", "genericPolycone",
+    })
+
     def __init__(self):
         self._evaluator = GdmIEvaluator()
 
@@ -61,6 +72,9 @@ class GdmIParser:
         self._assemblies: Dict[str, GdmlNode] = {}     # name -> assembly node
 
         self._world_ref: str = ""  # world volume name referenced in setup
+
+        # Unsupported solids encountered during parsing (for user warning)
+        self._unsupported_solids: List[Dict[str, str]] = []
 
     def parse_file(self, filepath: str) -> GdmlNode:
         """
@@ -120,6 +134,10 @@ class GdmIParser:
             if world_node not in file_node._children:
                 file_node.add_child(world_node)
 
+        # Attach list of unsupported solids for downstream warning
+        if self._unsupported_solids:
+            file_node._unsupported_solids = list(self._unsupported_solids)
+
         return file_node
 
     def _clear(self):
@@ -130,6 +148,7 @@ class GdmIParser:
         self._volumes.clear()
         self._assemblies.clear()
         self._world_ref = ""
+        self._unsupported_solids.clear()
 
     # ==================== <define> parsing ====================
 
@@ -220,6 +239,8 @@ class GdmIParser:
                 node = self._parse_polycone(child, name)
             else:
                 # All other solid types: store attributes for round-trip
+                # Note: these are NOT fully supported — they won't be rendered
+                # in 3D view but will be preserved for GDML export.
                 node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
                 node.gdml_tag = tag
                 node.gdml_attrs = dict(child.attrib)
@@ -227,6 +248,8 @@ class GdmIParser:
                 # e.g. polycone, polyhedra, xtru, booleans, multiUnion, scaledSolid
                 if len(child) > 0:
                     node.raw_solid_xml = ET.tostring(child, encoding="unicode")
+                # Track as unsupported for user warning
+                self._unsupported_solids.append({"tag": tag, "name": name})
 
             if node:
                 self._solids[name] = node

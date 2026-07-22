@@ -72,7 +72,7 @@ class VtkWidget(QWidget):
         # ── Build UI ──
         self._build_ui()
 
-        # ── VTK setup ──
+        # ── VTK / OpenGL setup ──
         ren_win = self._vtk_interactor.GetRenderWindow()
         ren_win.SetMultiSamples(0)
 
@@ -95,6 +95,70 @@ class VtkWidget(QWidget):
         self._cube_axes: Optional[vtkCubeAxesActor] = None
 
         self._vtk_interactor.Initialize()
+
+        # ── GPU / OpenGL context activation ──
+        import re as _re
+        ren_win.SetWindowName("Easy2Rad")
+        # Try on-screen (GPU-accelerated) first; fall back to off-screen
+        # (software/Mesa) if the GPU driver is missing (remote desktop,
+        # headless VM, basic display adapter, etc.).
+        self._gpu_active = False
+        ren_win.SetOffScreenRendering(False)
+        try:
+            ren_win.Render()
+            raw_caps = ren_win.ReportCapabilities() or ""
+            # Parse key OpenGL fields (same style as OCC's Viewer3d)
+            _s = _re.search
+            m_vdr = _s(r"OpenGL vendor string:\s*(.+)", raw_caps)
+            m_dev = _s(r"OpenGL renderer string:\s*(.+)", raw_caps)
+            m_ver = _s(r"OpenGL version string:\s*(.+)", raw_caps)
+            m_glsl = _s(r"GLSL version \(if available\):\s*(.+)", raw_caps)
+            if m_vdr:
+                self._gpu_info = f"{m_vdr.group(1)} / {m_dev.group(1) if m_dev else '?'}"
+                self._gpu_active = True
+                # Print GPU info in OCC style (matches cad2gdml's Viewer3d)
+                print("#" * 41, flush=True)
+                print("OpenGl information (VTK):", flush=True)
+                print(f"  GLvendor:  {m_vdr.group(1)}", flush=True)
+                print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
+                print(f"  GLversion: {m_ver.group(1) if m_ver else '?'}", flush=True)
+                print(f"  GLSL:      {m_glsl.group(1) if m_glsl else '?'}", flush=True)
+                # Also show pixel format from pixel format descriptor section
+                px_match = _s(
+                    r"(depth:\s+\d+.*?double buffer:\s+\w+)",
+                    raw_caps, _re.DOTALL)
+                if px_match:
+                    for line in px_match.group(1).strip().split("\n"):
+                        print(f"  {line.strip()}", flush=True)
+                print("#" * 41, flush=True)
+            else:
+                self._gpu_info = "no OpenGL renderer reported"
+        except Exception:
+            self._gpu_info = "OpenGL context creation failed"
+
+        if not self._gpu_active:
+            # Fallback: off-screen rendering (software / Mesa)
+            ren_win.SetOffScreenRendering(True)
+            try:
+                ren_win.Render()
+                raw_caps = ren_win.ReportCapabilities() or ""
+                _s = _re.search
+                m_vdr = _s(r"OpenGL vendor string:\s*(.+)", raw_caps)
+                m_dev = _s(r"OpenGL renderer string:\s*(.+)", raw_caps)
+                suffix = " (software)"
+                if m_vdr:
+                    self._gpu_info = f"{m_vdr.group(1)} / {m_dev.group(1) if m_dev else '?'}{suffix}"
+                else:
+                    self._gpu_info = "off-screen (software)"
+                print("#" * 41, flush=True)
+                print("OpenGl information (VTK, off-screen/software):", flush=True)
+                print(f"  GLvendor:  {m_vdr.group(1) if m_vdr else '?'}", flush=True)
+                print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
+                print("#" * 41, flush=True)
+            except Exception:
+                self._gpu_info = "off-screen (no GL)"
+            ren_win.SetOffScreenRendering(True)
+
         self._vtk_interactor.Start()
 
         self._setup_default_scene()

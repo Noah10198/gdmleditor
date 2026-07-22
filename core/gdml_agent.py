@@ -48,7 +48,8 @@ class GdmlAgent:
 
     def load_gdml_file(self, filepath: str) -> Tuple[bool, str]:
         """
-        Load a single GDML file.
+        Load a single GDML file (blocking, main-thread path).
+        For non-blocking import, use parse_file_only() + add_parsed_file_node().
 
         Args:
             filepath: GDML file path
@@ -57,22 +58,74 @@ class GdmlAgent:
             (success, error_message)
         """
         try:
-            file_name = Path(filepath).name
-            file_node = self._parser.parse_file(filepath)
-
-            # Assign entry_id to file node and all descendants
-            entry_id = self._generate_entry_id()
-            file_node.entry_id = entry_id
-            self._entry_id_map[entry_id] = file_node
-            self._root_node.add_child(file_node)
-
-            for child in file_node.get_all_descendants():
-                child.entry_id = self._generate_entry_id()
-                self._entry_id_map[child.entry_id] = child
-
-            return True, f"Loaded: {file_name}"
+            file_node, file_name = self._parse_file_only(filepath)
+            self._add_parsed_file_node(file_node)
+            return True, self._make_loaded_msg(file_name, file_node)
         except Exception as e:
             return False, str(e)
+
+    def parse_file_only(self, filepath: str) -> Tuple[Optional['GdmlNode'], str]:
+        """
+        Parse a GDML file WITHOUT mutating agent state.
+        Thread-safe — can be called from a background thread.
+
+        Returns:
+            (file_node, filename) on success
+            (None, error_message) on failure
+        """
+        try:
+            return self._parse_file_only(filepath)
+        except Exception as e:
+            return None, str(e)
+
+    def _parse_file_only(self, filepath: str) -> Tuple['GdmlNode', str]:
+        """Internal: parse file, return (file_node, filename)."""
+        file_name = Path(filepath).name
+        file_node = self._parser.parse_file(filepath)
+        return file_node, file_name
+
+    def add_parsed_file_node(self, file_node: 'GdmlNode') -> str:
+        """
+        Add a pre-parsed file node to agent state (MUST be called on main thread).
+        Returns the loaded message string.
+        """
+        return self._add_parsed_file_node(file_node)
+
+    def _add_parsed_file_node(self, file_node: 'GdmlNode') -> str:
+        """Internal: assign entry_ids and attach file_node to root."""
+        entry_id = self._generate_entry_id()
+        file_node.entry_id = entry_id
+        self._entry_id_map[entry_id] = file_node
+        self._root_node.add_child(file_node)
+
+        for child in file_node.get_all_descendants():
+            child.entry_id = self._generate_entry_id()
+            self._entry_id_map[child.entry_id] = child
+
+        return self._make_loaded_msg(file_node.name, file_node)
+
+    @staticmethod
+    def _make_loaded_msg(file_name: str, file_node: 'GdmlNode') -> str:
+        """Build the success message string."""
+        msg = f"Loaded: {file_name}"
+        unsupported = getattr(file_node, '_unsupported_solids', None)
+        if unsupported:
+            msg += f" ({len(unsupported)} solid type(s) not fully parsed)"
+        return msg
+
+    def get_unsupported_solids(self) -> List[Dict[str, str]]:
+        """
+        Collect all unsupported solid types across all loaded files.
+        Returns a list of {"tag": tag, "name": name, "file": filename}.
+        """
+        result = []
+        for file_node in self.get_all_file_nodes():
+            unsupported = getattr(file_node, '_unsupported_solids', None)
+            if unsupported:
+                filename = file_node.name
+                for s in unsupported:
+                    result.append({**s, "file": filename})
+        return result
 
     def get_root_node(self) -> GdmlNode:
         return self._root_node
