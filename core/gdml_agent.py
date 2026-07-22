@@ -210,14 +210,31 @@ class GdmlAgent:
         return (xmin, xmax, ymin, ymax, zmin, zmax)
 
     def _compute_global_position(self, node: GdmlNode) -> Tuple[float, float, float]:
-        """Walk up parent chain, accumulating all PHYVOL_NODE placements"""
+        """
+        Walk up parent chain, accumulating:
+        - PHYVOL_NODE placements (per-physvol positioning, with override support)
+        - GDML_FILE file_transform (file-level translate/rotate)
+
+        Note: placement overrides from Transform dialog must be accounted for,
+        otherwise bbox will use original (pre-transform) positions.
+        """
         tx = ty = tz = 0.0
         cur = node.parent
         while cur is not None:
-            if cur.node_type == GdmlNodeType.PHYVOL_NODE and cur.placement:
-                tx += cur.placement.x
-                ty += cur.placement.y
-                tz += cur.placement.z
+            if cur.node_type == GdmlNodeType.PHYVOL_NODE:
+                # Start from original GDML placement, then check for override
+                p = cur.placement
+                if cur.entry_id and cur.entry_id in self._placement_overrides:
+                    p = self._placement_overrides[cur.entry_id]
+                if p is not None:
+                    tx += p.x
+                    ty += p.y
+                    tz += p.z
+            elif cur.node_type == GdmlNodeType.GDML_FILE and cur.file_transform:
+                ft = cur.file_transform
+                tx += ft.x
+                ty += ft.y
+                tz += ft.z
             cur = cur.parent
         return (tx, ty, tz)
 
@@ -234,6 +251,17 @@ class GdmlAgent:
                     if c not in results:
                         results.append(c)
         return results
+
+    def get_world_materials(self) -> List[str]:
+        """Get distinct material names used by all world volumes."""
+        mats: Set[str] = set()
+        for w in self.get_world_nodes():
+            m = (w.material_name
+                 or (w.gdml_attrs or {}).get("materialref", "")
+                 or "").strip()
+            if m:
+                mats.add(m)
+        return list(mats)
 
     def set_world_size(self, world_node: GdmlNode, half: float):
         """

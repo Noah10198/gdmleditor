@@ -347,8 +347,17 @@ class MainWindow(QMainWindow):
             from core.gdml_writer import GdmlWriter
             root = self._gdml_agent.get_root_node()
             overrides = self._gdml_agent.get_all_placement_overrides()
+
+            # Check world material consistency (multi-file merge)
+            world_mats = self._gdml_agent.get_world_materials()
+            if len(world_mats) > 1:
+                QMessageBox.information(
+                    self, "World Material",
+                    "Detected multiple worlds with different materials.\n"
+                    "The system will use G4_AIR instead.")
+
             writer = GdmlWriter()
-            writer.write(root, overrides, file_path)
+            writer.write(root, overrides, file_path, mat_lib=self._mat_lib)
             self._logger.log_system("  [OK] Export complete")
         except Exception as e:
             self._logger.log_system(

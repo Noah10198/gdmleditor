@@ -10,16 +10,14 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
 
 
-def _create_emoji_icon(emoji: str, size: int = 36) -> QIcon:
+def _create_emoji_icon(emoji: str) -> QIcon:
     """Render emoji at 2x resolution for supersampled crispness."""
-    scale = 2
-    px = size * scale
-    pixmap = QPixmap(px, px)
+    pixmap = QPixmap(72, 72)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    font = QFont("Segoe UI Emoji", px - 24)
+    font = QFont("Segoe UI Emoji", 48)
     painter.setFont(font)
     painter.setPen(QColor(220, 220, 220))
     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)

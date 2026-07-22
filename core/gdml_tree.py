@@ -86,6 +86,16 @@ class GdmlNode(QObject):
         # Reference relations: volume references solid; physvol references volume
         self._ref_name: str = ""  # e.g. volumeref or solidref ref attribute value
 
+        # Raw XML of top-level sections (stored by parser for export fidelity)
+        self._raw_declaration: str = ""      # <?xml version="1.0" ... ?>
+        self._raw_define_xml: str = ""       # <define>...</define>
+        self._raw_materials_xml: str = ""    # <materials>...</materials>
+        self._raw_setup_xml: str = ""        # <setup>...</setup>
+
+        # Raw XML of the solid element (for complex solids with sub-elements)
+        # Used by writer for perfect round-trip of polycone/xtru/boolean etc.
+        self._raw_solid_xml: str = ""
+
     # ---- Properties ----
 
     @property
@@ -181,6 +191,46 @@ class GdmlNode(QObject):
     @ref_name.setter
     def ref_name(self, val: str):
         self._ref_name = val
+
+    @property
+    def raw_declaration(self) -> str:
+        return self._raw_declaration
+
+    @raw_declaration.setter
+    def raw_declaration(self, val: str):
+        self._raw_declaration = val
+
+    @property
+    def raw_define_xml(self) -> str:
+        return self._raw_define_xml
+
+    @raw_define_xml.setter
+    def raw_define_xml(self, val: str):
+        self._raw_define_xml = val
+
+    @property
+    def raw_materials_xml(self) -> str:
+        return self._raw_materials_xml
+
+    @raw_materials_xml.setter
+    def raw_materials_xml(self, val: str):
+        self._raw_materials_xml = val
+
+    @property
+    def raw_setup_xml(self) -> str:
+        return self._raw_setup_xml
+
+    @raw_setup_xml.setter
+    def raw_setup_xml(self, val: str):
+        self._raw_setup_xml = val
+
+    @property
+    def raw_solid_xml(self) -> str:
+        return self._raw_solid_xml
+
+    @raw_solid_xml.setter
+    def raw_solid_xml(self, val: str):
+        self._raw_solid_xml = val
 
     @property
     def entry_id(self) -> str:

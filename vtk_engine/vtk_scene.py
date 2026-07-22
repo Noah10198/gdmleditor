@@ -23,12 +23,13 @@ from vtkmodules.vtkRenderingCore import (
     vtkPolyDataMapper,
     vtkLight,
     vtkCamera,
+    vtkCellPicker,
 )
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkCommonCore import vtkCommand
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkRenderingCore import vtkCellPicker
+from vtkmodules.vtkFiltersSources import vtkCubeSource
 
 from core.gdml_tree import GdmlNode, GdmlNodeType, Placement
 from vtk_engine.vtk_solid_factory import VtkSolidFactory
@@ -241,9 +242,15 @@ class VtkScene:
           (with override support via _override_provider)
         - GDML_FILE ancestors: file-level transform (translates/rotates
           the entire imported file as a single group)
+
+        The WORLD_NODE (world box) is intentionally excluded from file_transform
+        so it stays fixed at the origin. Only the content geometry inside it
+        moves/rotates. This lets users see geometry poking out of the world
+        box after transform, and then Redefine World to re-envelop.
         """
         tx, ty, tz = 0.0, 0.0, 0.0
         rx, ry, rz = 0.0, 0.0, 0.0
+        is_world = node.node_type == GdmlNodeType.WORLD_NODE
 
         current = node.parent
         while current is not None:
@@ -262,14 +269,16 @@ class VtkScene:
                     ry += p.rot_y
                     rz += p.rot_z
             elif current.node_type == GdmlNodeType.GDML_FILE:
-                ft = current.file_transform
-                if ft is not None:
-                    tx += ft.x
-                    ty += ft.y
-                    tz += ft.z
-                    rx += ft.rot_x
-                    ry += ft.rot_y
-                    rz += ft.rot_z
+                # World node stays at origin — only content volumes move
+                if not is_world:
+                    ft = current.file_transform
+                    if ft is not None:
+                        tx += ft.x
+                        ty += ft.y
+                        tz += ft.z
+                        rx += ft.rot_x
+                        ry += ft.rot_y
+                        rz += ft.rot_z
             current = current.parent
 
         actor.SetPosition(tx, ty, tz)
@@ -356,14 +365,80 @@ class VtkScene:
         if not root_node.children:
             return
 
-        # Traverse file nodes
-        for file_node in root_node.children:
-            if file_node.node_type != GdmlNodeType.GDML_FILE:
-                continue
-            self._build_node_recursive(file_node, render_all_volumes=render_all_volumes)
+        file_nodes = [c for c in root_node.children
+                      if c.node_type == GdmlNodeType.GDML_FILE]
+        multi_file = len(file_nodes) > 1
+        # "Redefine World" sets all world nodes to the same size.
+        # When that's been done, replace individual worlds with a unified box.
+        unified = multi_file and self._detect_unified_world(root_node)
+
+        # Build geometry (suppress individual WORLD_NODEs in unified mode)
+        for file_node in file_nodes:
+            self._build_node_recursive(
+                file_node, render_all_volumes=render_all_volumes,
+                _world_rendered=[True] if unified else None)
+
+        # In unified mode: use the Redefine World size (all world nodes match)
+        # centered at the midpoint of all geometry.
+        if unified:
+            first_world = self._find_first_world(root_node)
+            rdx = rdy = rdz = 1000.0
+            if first_world and first_world.solid_params:
+                p = first_world.solid_params
+                rdx = p.get('x', 1000)
+                rdy = p.get('y', 1000)
+                rdz = p.get('z', 1000)
+
+            # Compute the exact bounding box of all geometry for centering
+            bounds = [float('inf'), float('-inf'),
+                      float('inf'), float('-inf'),
+                      float('inf'), float('-inf')]
+            has_geo = False
+            for actor in self._actor_map.values():
+                b = actor.GetBounds()
+                if b and b[1] >= b[0]:
+                    has_geo = True
+                    if b[0] < bounds[0]: bounds[0] = b[0]
+                    if b[1] > bounds[1]: bounds[1] = b[1]
+                    if b[2] < bounds[2]: bounds[2] = b[2]
+                    if b[3] > bounds[3]: bounds[3] = b[3]
+                    if b[4] < bounds[4]: bounds[4] = b[4]
+                    if b[5] > bounds[5]: bounds[5] = b[5]
+
+            if has_geo:
+                cx = (bounds[0] + bounds[1]) * 0.5
+                cy = (bounds[2] + bounds[3]) * 0.5
+                cz = (bounds[4] + bounds[5]) * 0.5
+                self._add_world_box(rdx, rdy, rdz, cx, cy, cz)
+            else:
+                self._add_world_box(rdx, rdy, rdz)
 
         self.reset_camera()
         self.render()
+
+    @staticmethod
+    def _find_first_world(root: GdmlNode) -> Optional[GdmlNode]:
+        """Find the first WORLD_NODE anywhere in the tree."""
+        for node in root.get_all_descendants():
+            if node.node_type == GdmlNodeType.WORLD_NODE:
+                return node
+        return None
+
+    @staticmethod
+    def _detect_unified_world(root: GdmlNode) -> bool:
+        """
+        Return True when ALL world nodes share the same solid_params,
+        which means "Redefine World" has been applied.
+        """
+        worlds = [n for n in root.get_all_descendants()
+                  if n.node_type == GdmlNodeType.WORLD_NODE]
+        if len(worlds) < 2:
+            return False
+        base = worlds[0].solid_params
+        for w in worlds[1:]:
+            if w.solid_params != base:
+                return False
+        return True
 
     @staticmethod
     def _is_under_world(node: GdmlNode) -> bool:
@@ -381,7 +456,8 @@ class VtkScene:
             parent = parent.parent
         return False
 
-    def _build_node_recursive(self, node: GdmlNode, *, render_all_volumes: bool = False):
+    def _build_node_recursive(self, node: GdmlNode, *, render_all_volumes: bool = False,
+                               _world_rendered: Optional[List[bool]] = None):
         """
         Recursively build scene nodes from the GdmlNode tree.
 
@@ -389,7 +465,9 @@ class VtkScene:
         - VOLUME_NODE definitions (direct children of GDML_FILE) are the
           "LogicalVolumeStore" — they are NOT rendered directly.
         - Only two types create actors:
-          1. WORLD_NODE — the top-level reference from <setup>
+          1. WORLD_NODE — the top-level reference from <setup>.
+             When multiple files are loaded, only the FIRST world node
+             is rendered to avoid overlapping world boxes.
           2. Instance VOLUME_NODEs — clones created under PHYVOL_NODEs
              that are part of the WORLD_NODE subtree, representing
              G4PVPlacements with their own spatial transform.
@@ -398,20 +476,47 @@ class VtkScene:
         - Any VOLUME_NODE with solid_params is rendered, regardless of parent.
           This is used for the single-solid preview window.
         """
+        if _world_rendered is None:
+            _world_rendered = [False]
+
         if node.solid_params:
             if render_all_volumes:
                 self.add_node(node)
             else:
-                is_world = node.node_type == GdmlNodeType.WORLD_NODE
+                is_world = (node.node_type == GdmlNodeType.WORLD_NODE
+                            and not _world_rendered[0])
                 is_instance = (node.node_type == GdmlNodeType.VOLUME_NODE
                                and node.parent
                                and node.parent.node_type == GdmlNodeType.PHYVOL_NODE
                                and self._is_under_world(node))
+                if is_world:
+                    _world_rendered[0] = True
                 if is_world or is_instance:
                     self.add_node(node)
 
         for child in node.children:
-            self._build_node_recursive(child, render_all_volumes=render_all_volumes)
+            self._build_node_recursive(child, render_all_volumes=render_all_volumes,
+                                       _world_rendered=_world_rendered)
+
+    def _add_world_box(self, sx: float, sy: float, sz: float,
+                       cx: float = 0.0, cy: float = 0.0, cz: float = 0.0):
+        """Add a unified world reference box (wireframe)."""
+        cube = vtkCubeSource()
+        cube.SetXLength(sx)
+        cube.SetYLength(sy)
+        cube.SetZLength(sz)
+        cube.Update()
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(cube.GetOutput())
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetRepresentationToWireframe()
+        actor.GetProperty().SetColor(0.3, 0.8, 1.0)
+        actor.GetProperty().SetLineWidth(2)
+        transform = vtkTransform()
+        transform.Translate(cx, cy, cz)
+        actor.SetUserTransform(transform)
+        self._renderer.AddActor(actor)
 
     def get_actor_for_node(self, entry_id: str) -> Optional[vtkActor]:
         """Get actor for a given node"""

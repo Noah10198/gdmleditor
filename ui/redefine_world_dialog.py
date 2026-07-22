@@ -33,7 +33,7 @@ class RedefineWorldDialog(QDialog):
     ):
         """
         Args:
-            bbox: (xmin, xmax, ymin, ymax, zmin, zmax)
+            bbox: (xmin, xmax, ymin, ymax, zmin, zmax) — all geometry in WORLD space
             current_world_size: Current world volume size (edge length), 0 = unknown
             parent: Parent widget
         """
@@ -46,13 +46,18 @@ class RedefineWorldDialog(QDialog):
         self._current_world_size = current_world_size
         self._selected_factor: int = 5  # default
 
-        # Compute scene max span
+        # Compute scene extent AND max distance from origin
         xmin, xmax, ymin, ymax, zmin, zmax = bbox
         self._scene_extent = max(
-            xmax - xmin,
-            ymax - ymin,
-            zmax - zmin,
-            1.0  # Minimum 1mm, avoid division by zero
+            xmax - xmin, ymax - ymin, zmax - zmin, 1.0
+        )
+        # Furthest point from origin in any axis — needed when geometry
+        # has been translated away from (0,0,0)
+        self._max_radius = max(
+            abs(xmin), abs(xmax),
+            abs(ymin), abs(ymax),
+            abs(zmin), abs(zmax),
+            1.0
         )
 
         self._build_ui()
@@ -142,11 +147,14 @@ class RedefineWorldDialog(QDialog):
         """Update new world size label"""
         factor = self._factor_combo.currentData()
         self._selected_factor = factor
-        half = self._scene_extent * factor / 2.0
+        # Use max_radius: ensure the world box (centered at origin) covers
+        # both (0,0,0) and the furthest geometry point, with factor padding
+        half = self._max_radius * factor
         full = half * 2.0
         self._size_label.setText(
             f"New world:  {full:.1f} × {full:.1f} × {full:.1f} mm\n"
-            f"(half = {half:.1f} mm)"
+            f"(half = {half:.1f} mm)\n"
+            f"Max distance from origin: {self._max_radius:.1f} mm"
         )
 
     # ---- Public interface ----
@@ -158,5 +166,5 @@ class RedefineWorldDialog(QDialog):
 
     @property
     def world_half_size(self) -> float:
-        """Computed world volume half-size"""
-        return self._scene_extent * self._selected_factor / 2.0
+        """Computed world volume half-size — based on max distance from origin."""
+        return self._max_radius * self._selected_factor

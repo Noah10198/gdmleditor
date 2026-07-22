@@ -13,7 +13,7 @@ Aligns with cad2gdml's ProjectTreeWidget style:
 from typing import Optional, List
 
 from PyQt6.QtWidgets import (
-    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox,
+    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QMenu, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
@@ -51,15 +51,10 @@ class ProjectTreeWidget(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        """Build the tree and header label — same pattern as cad2gdml."""
+        """Build the tree with a single root node as the main entry point."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        header = QLabel("  Project Tree")
-        header.setObjectName("TreeHeader")
-        header.setFixedHeight(28)
-        layout.addWidget(header)
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
@@ -70,19 +65,28 @@ class ProjectTreeWidget(QWidget):
         self._tree.setAnimated(True)
         self._tree.setIndentation(16)
 
-        # Material nodes first (matches cad2gdml: Global → Local → Geometry)
-        self._global_mat_root = QTreeWidgetItem(self._tree, ["Global Materials"])
+        # Single bold root entry: "Project Tree" — the total node entrance
+        self._project_root = QTreeWidgetItem(self._tree, ["Project Tree"])
+        font = self._project_root.font(0)
+        font.setBold(True)
+        self._project_root.setFont(0, font)
+        self._project_root.setExpanded(True)
+        self._project_root.setFlags(self._project_root.flags()
+                                     & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+        # Material nodes under the root
+        self._global_mat_root = QTreeWidgetItem(self._project_root, ["Global Materials"])
         self._global_mat_root.setExpanded(False)  # 278 items, keep collapsed
         self._global_mat_root.setFlags(self._global_mat_root.flags()
                                         & ~Qt.ItemFlag.ItemIsUserCheckable)
 
-        self._local_mat_root = QTreeWidgetItem(self._tree, ["Local Materials"])
+        self._local_mat_root = QTreeWidgetItem(self._project_root, ["Local Materials"])
         self._local_mat_root.setExpanded(True)
         self._local_mat_root.setFlags(self._local_mat_root.flags()
                                        & ~Qt.ItemFlag.ItemIsUserCheckable)
 
-        # Geometry root node (after materials, matching cad2gdml)
-        self._geometry_root = QTreeWidgetItem(self._tree, ["Geometry"])
+        # Geometry root under the root
+        self._geometry_root = QTreeWidgetItem(self._project_root, ["Geometry"])
         self._geometry_root.setExpanded(True)
 
         layout.addWidget(self._tree)
@@ -99,33 +103,21 @@ class ProjectTreeWidget(QWidget):
     def set_dark_theme(self, is_dark: bool):
         """Switch between dark and light appearance — matches cad2gdml's palette."""
         if is_dark:
-            hdr_bg = "#181825"
-            hdr_fg = "#a6adc8"
-            hdr_border = "#313244"
             tree_bg = "#1e1e2e"
             tree_fg = "#cdd6f4"
+            root_bg = "#181825"
             sel_bg = "#313244"
             sel_fg = "#cdd6f4"
             hover_bg = "#282840"
         else:
-            hdr_bg = "#e8e8e8"
-            hdr_fg = "#555555"
-            hdr_border = "#d0d0d0"
             tree_bg = "#ffffff"
             tree_fg = "#2c2c2c"
+            root_bg = "#f0f0f0"
             sel_bg = "#d0e4f6"
             sel_fg = "#2c2c2c"
             hover_bg = "#e8f0fe"
 
         self.setStyleSheet(f"""
-            #TreeHeader {{
-                background-color: {hdr_bg};
-                color: {hdr_fg};
-                font-size: 13px;
-                font-weight: bold;
-                padding: 4px 8px;
-                border-bottom: 1px solid {hdr_border};
-            }}
             QTreeWidget {{
                 background-color: {tree_bg};
                 color: {tree_fg};
@@ -143,6 +135,9 @@ class ProjectTreeWidget(QWidget):
             }}
             QTreeWidget::item:hover {{
                 background-color: {hover_bg};
+            }}
+            QTreeWidget::item:disabled {{
+                color: {tree_fg};
             }}
         """)
 
@@ -286,8 +281,8 @@ class ProjectTreeWidget(QWidget):
         self._geometry_root.setExpanded(True)
 
     def _build_file_tree(self, file_item: QTreeWidgetItem, file_node: GdmlNode):
-        """Build Solids + World groups under a file node."""
-        # Collect all SOLID_DEF nodes from the entire subtree
+        """Build Solids + Assemblies + World groups under a file node."""
+        # ── Collect all SOLID_DEF nodes from the entire subtree ──
         solid_nodes: List[GdmlNode] = []
         self._collect_solid_nodes(file_node, solid_nodes)
 
@@ -302,7 +297,21 @@ class ProjectTreeWidget(QWidget):
                 solid_item.setFlags(solid_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                 solids_item.addChild(solid_item)
 
-        # Create "World" group — only show the physical hierarchy starting from
+        # ── Collect ASSEMBLY_NODE definitions from file_node's direct children ──
+        asm_nodes = [
+            c for c in file_node.children
+            if c.node_type == GdmlNodeType.ASSEMBLY_NODE
+        ]
+        if asm_nodes:
+            asm_group = QTreeWidgetItem(file_item, ["Assemblies"])
+            asm_group.setFlags(asm_group.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            for asm_node in asm_nodes:
+                asm_item = self._create_tree_item(asm_node)
+                asm_group.addChild(asm_item)
+                # Build assembly physvol hierarchy (reuse world tree builder)
+                self._build_world_tree(asm_item, asm_node)
+
+        # ── Create "World" group — only show the physical hierarchy starting from
         # WORLD_NODE. Other VOLUME_NODEs under file_node are logical definitions
         # (Geant4 LogicalVolumeStore) and are not shown in the hierarchy.
         world_node = next(
@@ -340,9 +349,13 @@ class ProjectTreeWidget(QWidget):
             self._build_world_tree(child_item, child)
 
     def _create_tree_item(self, node: GdmlNode) -> QTreeWidgetItem:
-        """Create tree item from node — clean name, no type prefix."""
+        """Create tree item from node — clean name with type hint for solids."""
         item = QTreeWidgetItem()
-        display_name = node.name if node.name else "(unnamed)"
+        display_name = (getattr(node, '_display_name', None)
+                        or node.name or "(unnamed)")
+        # Show GDML type tag for solid definitions
+        if node.node_type == GdmlNodeType.SOLID_DEF and node.gdml_tag and node.gdml_tag != "box":
+            display_name += f" [{node.gdml_tag}]"
         item.setText(0, display_name)
         item.setData(0, TREE_ITEM_DATA_ROLE, node.entry_id)
         item.setData(0, TREE_NODE_TYPE_ROLE, node.node_type.value)

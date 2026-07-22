@@ -58,6 +58,7 @@ class GdmIParser:
         self._rotations: Dict[str, Tuple[float, float, float]] = {}  # name -> (x,y,z)
         self._solids: Dict[str, GdmlNode] = {}        # name -> solid node
         self._volumes: Dict[str, GdmlNode] = {}        # name -> volume node
+        self._assemblies: Dict[str, GdmlNode] = {}     # name -> assembly node
 
         self._world_ref: str = ""  # world volume name referenced in setup
 
@@ -76,6 +77,15 @@ class GdmIParser:
         tree = ET.parse(filepath)
         root = tree.getroot()
 
+        # Capture original XML declaration (comment, standalone, etc.)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                first = f.readline().strip()
+                if first.startswith("<?xml"):
+                    file_node.raw_declaration = first
+        except Exception:
+            pass
+
         if root.tag != "gdml":
             raise ValueError(f"Not a valid GDML file: root tag is '{root.tag}'")
 
@@ -87,20 +97,22 @@ class GdmIParser:
             tag = child.tag
             if tag == "define":
                 self._parse_define(child)
+                file_node.raw_define_xml = ET.tostring(child, encoding="unicode")
             elif tag == "materials":
                 self._parse_materials(child)
+                file_node.raw_materials_xml = ET.tostring(child, encoding="unicode")
             elif tag == "solids":
                 self._parse_solids(child)
             elif tag == "structure":
                 self._parse_structure(child, file_node)
             elif tag == "setup":
                 self._parse_setup(child)
+                file_node.raw_setup_xml = ET.tostring(child, encoding="unicode")
 
-        # Build world node
+        # Build world node — keep original name so raw_setup_xml ref matches
         if self._world_ref and self._world_ref in self._volumes:
             world_node = self._volumes[self._world_ref]
             world_node.node_type = GdmlNodeType.WORLD_NODE
-            world_node.name = f"World_{self._world_ref}"
 
             # The world volume was already added as child of file_node in _parse_structure,
             # but may have been moved elsewhere by physvol volumeref.
@@ -116,6 +128,7 @@ class GdmIParser:
         self._rotations.clear()
         self._solids.clear()
         self._volumes.clear()
+        self._assemblies.clear()
         self._world_ref = ""
 
     # ==================== <define> parsing ====================
@@ -190,17 +203,30 @@ class GdmIParser:
                 node = self._parse_box(child, name)
             elif tag == "sphere":
                 node = self._parse_sphere(child, name)
-            elif tag == "tube":
+            elif tag in ("tube", "tubs"):
                 node = self._parse_tube(child, name)
+                node.gdml_tag = tag  # preserve original tag name (tubs vs tube)
             elif tag in ("cone",):
                 node = self._parse_cone(child, name)
             elif tag == "tessellated":
                 node = self._parse_tessellated(child, name)
+            elif tag == "orb":
+                node = self._parse_orb(child, name)
+            elif tag == "torus":
+                node = self._parse_torus(child, name)
+            elif tag == "ellipsoid":
+                node = self._parse_ellipsoid(child, name)
+            elif tag in ("polycone", "genericPolycone"):
+                node = self._parse_polycone(child, name)
             else:
-                # Unsupported type, create placeholder node
+                # All other solid types: store attributes for round-trip
                 node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
                 node.gdml_tag = tag
                 node.gdml_attrs = dict(child.attrib)
+                # Store raw XML for complex solids (those with sub-elements)
+                # e.g. polycone, polyhedra, xtru, booleans, multiUnion, scaledSolid
+                if len(child) > 0:
+                    node.raw_solid_xml = ET.tostring(child, encoding="unicode")
 
             if node:
                 self._solids[name] = node
@@ -354,7 +380,81 @@ class GdmIParser:
             "triangles": resolved_triangles,
             "quadrangles": resolved_quadrangles,
         }
+        # Preserve raw XML for perfect-fidelity export
+        node.raw_solid_xml = ET.tostring(elem, encoding="unicode")
 
+        return node
+
+    def _parse_orb(self, elem: ET.Element, name: str) -> GdmlNode:
+        """Parse an orb solid (full sphere with single radius)"""
+        node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
+        node.gdml_tag = "orb"
+        node.gdml_attrs = dict(elem.attrib)
+        lfactor = self._LENGTH_UNITS.get(elem.get("lunit", "mm"), 1.0)
+        r = self._evaluator.evaluate(elem.get("r", "1")) * lfactor
+        node.solid_params = {"rmax": r, "rmin": 0,
+                             "startphi": 0, "deltaphi": 360,
+                             "starttheta": 0, "deltatheta": 180}
+        return node
+
+    def _parse_torus(self, elem: ET.Element, name: str) -> GdmlNode:
+        """Parse a torus solid"""
+        node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
+        node.gdml_tag = "torus"
+        node.gdml_attrs = dict(elem.attrib)
+        lfactor = self._LENGTH_UNITS.get(elem.get("lunit", "mm"), 1.0)
+        afactor = self._ANGLE_UNITS.get(elem.get("aunit", "deg"), 1.0)
+        rtor = self._evaluator.evaluate(elem.get("rtor", "1")) * lfactor
+        rmin = self._evaluator.evaluate(elem.get("rmin", "0")) * lfactor
+        rmax = self._evaluator.evaluate(elem.get("rmax", "1")) * lfactor
+        startphi = self._evaluator.evaluate(elem.get("startphi", "0")) * afactor
+        deltaphi = self._evaluator.evaluate(elem.get("deltaphi", "360")) * afactor
+        node.solid_params = {
+            "rtor": rtor, "rmin": rmin, "rmax": rmax,
+            "startphi": startphi, "deltaphi": deltaphi,
+        }
+        return node
+
+    def _parse_ellipsoid(self, elem: ET.Element, name: str) -> GdmlNode:
+        """Parse an ellipsoid solid"""
+        node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
+        node.gdml_tag = "ellipsoid"
+        node.gdml_attrs = dict(elem.attrib)
+        lfactor = self._LENGTH_UNITS.get(elem.get("lunit", "mm"), 1.0)
+        ax = self._evaluator.evaluate(elem.get("ax", "1")) * lfactor
+        by = self._evaluator.evaluate(elem.get("by", "1")) * lfactor
+        cz = self._evaluator.evaluate(elem.get("cz", "1")) * lfactor
+        zcut1 = self._evaluator.evaluate(elem.get("zcut1", "-99999")) * lfactor
+        zcut2 = self._evaluator.evaluate(elem.get("zcut2", "99999")) * lfactor
+        node.solid_params = {
+            "ax": ax, "by": by, "cz": cz,
+            "zcut1": zcut1, "zcut2": zcut2,
+        }
+        return node
+
+    def _parse_polycone(self, elem: ET.Element, name: str) -> GdmlNode:
+        """Parse a polycone solid (stacked conical sections)"""
+        node = GdmlNode(GdmlNodeType.SOLID_DEF, name)
+        node.gdml_tag = "polycone"
+        node.gdml_attrs = dict(elem.attrib)
+        # Store raw XML for round-trip (has <zplane> sub-elements)
+        node.raw_solid_xml = ET.tostring(elem, encoding="unicode")
+        lfactor = self._LENGTH_UNITS.get(elem.get("lunit", "mm"), 1.0)
+        afactor = self._ANGLE_UNITS.get(elem.get("aunit", "deg"), 1.0)
+        startphi = self._evaluator.evaluate(elem.get("startphi", "0")) * afactor
+        deltaphi = self._evaluator.evaluate(elem.get("deltaphi", "360")) * afactor
+        # Extract zplane sections
+        zplanes = []
+        for child in elem:
+            if child.tag == "zplane":
+                z = self._evaluator.evaluate(child.get("z", "0")) * lfactor
+                rmin = self._evaluator.evaluate(child.get("rmin", "0")) * lfactor
+                rmax = self._evaluator.evaluate(child.get("rmax", "1")) * lfactor
+                zplanes.append({"z": z, "rmin": rmin, "rmax": rmax})
+        node.solid_params = {
+            "startphi": startphi, "deltaphi": deltaphi,
+            "zplanes": zplanes,
+        }
         return node
 
     # ==================== <structure> parsing ====================
@@ -381,7 +481,8 @@ class GdmIParser:
             elif tag == "assembly":
                 asm_node = self._parse_assembly(child)
                 if asm_node:
-                    # Assemblies also go to the store
+                    asm_name = asm_node.name
+                    self._assemblies[asm_name] = asm_node
                     parent_node.add_child(asm_node)
 
     def _parse_volume(self, vol_elem: ET.Element) -> Optional[GdmlNode]:
@@ -446,7 +547,8 @@ class GdmIParser:
         ref_name = phys_elem.find("volumeref")
         ref = ref_name.get("ref", "") if ref_name is not None else ""
         if not name and ref:
-            phys_node.name = f"physvol -> {ref}"
+            phys_node._display_name = f"physvol - {ref}"
+            phys_node.name = ""  # Keep name empty so exporter doesn't write auto-generated name
         phys_node.ref_name = ref
 
         for child in phys_elem:
@@ -466,6 +568,17 @@ class GdmIParser:
                     ref_vol = self._volumes[ref]
                     inst = self._clone_volume_instance(ref_vol)
                     phys_node.add_child(inst)
+                elif ref in self._assemblies:
+                    # physvol can also reference an <assembly>
+                    # Clone all of the assembly's physvol children (with their
+                    # volume instance subtrees) under this physvol, so the
+                    # 3D scene builder can find and render them.
+                    asm_node = self._assemblies[ref]
+                    phys_node.gdml_attrs["assemblyref"] = ref
+                    for asm_child in asm_node.children:
+                        if asm_child.node_type == GdmlNodeType.PHYVOL_NODE:
+                            cloned_pv = self._clone_physvol(asm_child)
+                            phys_node.add_child(cloned_pv)
 
             elif tag == "position":
                 unit = child.get("unit", "mm")
@@ -480,6 +593,7 @@ class GdmIParser:
 
             elif tag == "positionref":
                 ref = child.get("ref", "")
+                phys_node.gdml_attrs["positionref"] = ref
                 if ref in self._positions:
                     pos = self._positions[ref]
                     phys_node.placement.x = pos[0]
@@ -499,6 +613,7 @@ class GdmIParser:
 
             elif tag == "rotationref":
                 ref = child.get("ref", "")
+                phys_node.gdml_attrs["rotationref"] = ref
                 if ref in self._rotations:
                     rot = self._rotations[ref]
                     phys_node.placement.rot_x = rot[0]
@@ -546,6 +661,10 @@ class GdmIParser:
             if child.node_type == GdmlNodeType.VOLUME_NODE:
                 inst_clone = self._clone_volume_instance(child)
                 clone.add_child(inst_clone)
+            elif child.node_type == GdmlNodeType.PHYVOL_NODE:
+                # Handle nested assembly physvol children
+                pv_clone = self._clone_physvol(child)
+                clone.add_child(pv_clone)
 
         return clone
 
