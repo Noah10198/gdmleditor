@@ -2,24 +2,17 @@
 
 ## Known Limitations
 
-### 1. Large-scale Geometry Rendering Performance
-
-- **Issue**: Interactive frame rate degrades significantly beyond ~5,000 independent physvols
-- **Cause**: Each physvol creates an independent `vtkActor`; CPU draw call overhead is the bottleneck
-- **Detail**: See `04_performance_analysis.md`
-- **Status**: Root cause identified, optimization pending
-
-### 2. Non-renderable Solid Types
+### 1. Non-renderable Solid Types
 
 ~25 standard GDML solid types (e.g. polyhedra, xtru, cutTube, tet, etc.) are preserved as raw XML but cannot be rendered in the 3D view:
 - Warning dialog shown on import
 - Export still works — these types are written back verbatim
 
-### 3. Boolean Operation Visualization
+### 2. Boolean Operation Visualization
 
 Boolean solids (union/subtraction/intersection) are stored as raw XML; the 3D view cannot display boolean operation results.
 
-### 4. Unimplemented GDML Features
+### 3. Unimplemented GDML Features
 
 | Feature | Notes |
 |---------|-------|
@@ -31,13 +24,13 @@ Boolean solids (union/subtraction/intersection) are stored as raw XML; the 3D vi
 | bordersurface/skinsurface | Optical surfaces not supported |
 | isotope | Isotope definitions skipped |
 
-### 5. Expression Evaluator
+### 4. Expression Evaluator
 
 - Based on Python's `eval()`, basic arithmetic only
 - No user-defined function support
 - May fail on complex nested expressions
 
-### 6. Name Uniqueness
+### 5. Name Uniqueness
 
 - All `entry_id` values are derived from node names
 - Duplicate names may lead to ID conflicts
