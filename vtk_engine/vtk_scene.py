@@ -66,6 +66,11 @@ class VtkScene:
         self._pick_handler: Optional[Callable[[str], None]] = None
         self._picker = vtkCellPicker()
 
+        # 大几何场景构建的进度回调：callable(done_nodes:int)，纯 Python、
+        # 不依赖 Qt，由 UI 层注入（用于大文件导入时保持界面响应）。
+        self._build_progress_cb: Optional[Callable[[int], None]] = None
+        self._build_counter = 0
+
         # Set gradient background
         self._renderer.SetBackground(0.12, 0.12, 0.15)
         self._renderer.SetBackground2(0.25, 0.25, 0.30)
@@ -457,6 +462,19 @@ class VtkScene:
 
     # ==================== Scene building ====================
 
+    def set_build_progress_callback(self, cb: Optional[Callable[[int], None]]):
+        """设置大场景构建进度回调（UI 层注入）；传 None 清除。"""
+        self._build_progress_cb = cb
+
+    def _bump_build_progress(self):
+        """每处理一个树节点计数，约每 256 节点上报一次进度。"""
+        cb = self._build_progress_cb
+        if cb is None:
+            return
+        self._build_counter += 1
+        if self._build_counter % 256 == 0:
+            cb(self._build_counter)
+
     def build_from_tree(self, root_node: GdmlNode, *, render_all_volumes: bool = False):
         """
         Recursively build scene from GdmlNode tree.
@@ -470,6 +488,9 @@ class VtkScene:
                 skipping LogicalVolumeStore definitions.
         """
         self.clear()
+        self._build_counter = 0
+        # 树整体重建：先清几何缓存，避免旧树对象销毁后 id 复用导致错配
+        self._solid_factory.clear_cache()
 
         if not root_node.children:
             return
@@ -587,6 +608,8 @@ class VtkScene:
         """
         if _world_rendered is None:
             _world_rendered = [False]
+
+        self._bump_build_progress()
 
         if node.solid_params:
             if render_all_volumes:

@@ -80,6 +80,12 @@ class VtkSolidFactory:
             return
         self._initialized = True
 
+        # 几何缓存：几何键 -> vtkPolyDataMapper。同一 source volume 的多
+        # 物理实例共享一份 polydata/mapper，避免重复网格化、重复 VBO 上传
+        # 与每个 actor 重复编译着色器 —— 上万放置实例的文件（如 g4e 的
+        # 1.6 万 physvol）渲染卡顿与构建慢的主要来源正是重复建几何。
+        self._geometry_cache: Dict[tuple, vtkPolyDataMapper] = {}
+
     # ==================== Main creation interface ====================
 
     def create_actor(self, node: GdmlNode) -> Optional[vtkActor]:
@@ -92,33 +98,9 @@ class VtkSolidFactory:
         Returns:
             vtkActor object, or None if creation fails
         """
-        gdml_tag = node.gdml_tag
-        params = node.solid_params
-
-        if gdml_tag in ("box",):
-            poly_data = self._create_box(params)
-        elif gdml_tag in ("sphere", "orb"):
-            poly_data = self._create_sphere(params)
-        elif gdml_tag in ("tube", "tubs"):
-            poly_data = self._create_tube(params)
-        elif gdml_tag in ("cone",):
-            poly_data = self._create_cone(params)
-        elif gdml_tag == "tessellated":
-            poly_data = self._create_tessellated(node)
-        elif gdml_tag == "torus":
-            poly_data = self._create_torus(params)
-        elif gdml_tag == "ellipsoid":
-            poly_data = self._create_ellipsoid(params)
-        elif gdml_tag in ("polycone", "genericPolycone"):
-            poly_data = self._create_polycone(params)
-        else:
+        mapper = self._get_shared_mapper(node)
+        if mapper is None:
             return None
-
-        if poly_data is None:
-            return None
-
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly_data)
 
         actor = vtkActor()
         actor.SetMapper(mapper)
@@ -143,6 +125,79 @@ class VtkSolidFactory:
             actor.GetProperty().SetRepresentationToWireframe()
 
         return actor
+
+    # ==================== Shared geometry / mapper cache ====================
+
+    def clear_cache(self) -> None:
+        """清空几何缓存（每次全量 rebuild 前调用，防对象 id 复用错配）。"""
+        self._geometry_cache.clear()
+
+    def _geometry_key(self, node: GdmlNode) -> Optional[tuple]:
+        """几何身份键，用于多物理实例共享 mapper。
+
+        同一 source volume 的物理实例由解析器浅拷贝 solid_params 生成：
+        标量参数值相同；list/dict 参数（tessellated 的 vertices/triangles、
+        polycone 的 zplanes 等）共享同一个嵌套对象。因此标量取量化数值、
+        嵌套对象取 id()，零开销且能精确区分几何。
+        """
+        tag = node.gdml_tag
+        if not tag or not node.solid_params:
+            return None
+        parts: List[object] = [tag]
+        for k in sorted(node.solid_params.keys()):
+            v = node.solid_params[k]
+            if isinstance(v, float):
+                parts.append((k, round(v, 6)))
+            elif isinstance(v, int):
+                parts.append((k, v))
+            elif isinstance(v, dict):
+                parts.append((k, "dict", id(v)))
+            elif isinstance(v, list):
+                parts.append((k, "list", id(v)))
+            else:
+                parts.append((k, type(v).__name__, id(v)))
+        return tuple(parts)
+
+    def _get_shared_mapper(self, node: GdmlNode) -> Optional[vtkPolyDataMapper]:
+        """取节点几何对应的 mapper；同几何实例共享同一份 polydata + mapper。"""
+        key = self._geometry_key(node)
+        if key is not None:
+            cached = self._geometry_cache.get(key)
+            if cached is not None:
+                return cached
+
+        poly_data = self._build_polydata(node)
+        if poly_data is None:
+            return None
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(poly_data)
+        if key is not None:
+            self._geometry_cache[key] = mapper
+        return mapper
+
+    def _build_polydata(self, node: GdmlNode) -> Optional[vtkPolyData]:
+        """按 solid 类型构建几何 polydata（缓存未命中时的底层路径）。"""
+        params = node.solid_params
+        gdml_tag = node.gdml_tag
+
+        if gdml_tag in ("box",):
+            return self._create_box(params)
+        elif gdml_tag in ("sphere", "orb"):
+            return self._create_sphere(params)
+        elif gdml_tag in ("tube", "tubs"):
+            return self._create_tube(params)
+        elif gdml_tag in ("cone",):
+            return self._create_cone(params)
+        elif gdml_tag == "tessellated":
+            return self._create_tessellated(node)
+        elif gdml_tag == "torus":
+            return self._create_torus(params)
+        elif gdml_tag == "ellipsoid":
+            return self._create_ellipsoid(params)
+        elif gdml_tag in ("polycone", "genericPolycone"):
+            return self._create_polycone(params)
+        return None
 
     # ==================== Per-type creation methods ====================
 

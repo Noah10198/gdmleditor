@@ -440,10 +440,13 @@ class MainWindow(QMainWindow):
                                 f"Failed to import:\n{msg}")
 
     def _on_import_all_done(self, progress_dialog):
-        """Called on main thread when ALL files are parsed."""
-        progress_dialog.close()
+        """Called on main thread when ALL files are parsed.
 
-        # Clean up thread references
+        The progress dialog is kept open until the project tree AND the
+        3D scene are fully rebuilt — otherwise large geometries leave the
+        UI frozen-looking during rebuild with no progress feedback.
+        """
+        # Clean up thread references (dialog stays open during rebuild)
         if self._import_thread:
             self._import_thread.quit()
             self._import_thread.wait()
@@ -451,9 +454,10 @@ class MainWindow(QMainWindow):
         self._import_worker = None
 
         self._logger.log_system("All files parsed, building UI...")
-        QApplication.processEvents()
-
-        self._rebuild_ui()
+        try:
+            self._rebuild_ui(progress_dialog)
+        finally:
+            progress_dialog.close()
         self._check_unsupported_solids()
 
     def _check_unsupported_solids(self):
@@ -878,20 +882,54 @@ class MainWindow(QMainWindow):
 
     # ==================== Helper methods ====================
 
-    def _rebuild_ui(self):
-        """Rebuild UI after import"""
+    def _rebuild_ui(self, progress=None):
+        """Rebuild UI after import.
+
+        When `progress` (a QProgressDialog) is given — the large-file async
+        import path — the tree/scene build loops periodically refresh the
+        dialog text and pump the event loop, keeping the UI responsive while
+        large geometry is being rebuilt.
+        """
         root = self._gdml_agent.get_root_node()
-        self._project_tree.build_from_node_tree(root)
+        scene = self._vtk_widget.get_scene()
 
-        # Build scene first (actors added), then show widget.
-        # showEvent → Initialize() → Start() → ResetCamera() triggers
-        # the first render, which will draw the pre-built scene.
-        self._vtk_widget.build_scene(root)
+        tree_cb = None
+        if progress is not None:
+            if scene is not None:
+                scene.set_build_progress_callback(
+                    self._make_rebuild_flusher(progress, "3D scene"))
+            tree_cb = self._make_rebuild_flusher(progress, "project tree")
+
+        try:
+            self._project_tree.build_from_node_tree(root, progress_cb=tree_cb)
+
+            # Build scene first (actors added), then show widget.
+            # showEvent → Initialize() → Start() → ResetCamera() triggers
+            # the first render, which will draw the pre-built scene.
+            self._vtk_widget.build_scene(root)
+        finally:
+            if scene is not None:
+                scene.set_build_progress_callback(None)
+
         self._center_stack.setCurrentIndex(1)  # show VtkWidget → showEvent fires
-
         count = len(self._gdml_agent.get_all_file_nodes())
         self._status_label.setText(f"Files loaded: {count}")
         self._logger.log_system(f"Rebuilt UI with {count} file(s)")
+
+    def _make_rebuild_flusher(self, progress: object, what: str):
+        """Build progress callback: throttled dialog refresh + event pumping."""
+        import time
+        state = {"last": 0.0}
+
+        def flush(done: int):
+            now = time.monotonic()
+            if now - state["last"] >= 0.1:
+                state["last"] = now
+                progress.setLabelText(
+                    f"Building {what}... ({done} nodes processed)")
+                QApplication.processEvents()
+
+        return flush
 
     def get_system_log_widget(self):
         """Get log widget (for main.py to configure)"""

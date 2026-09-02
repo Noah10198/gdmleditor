@@ -161,6 +161,11 @@ class VtkWidget(QWidget):
 
         self._vtk_interactor.Start()
 
+        # 关闭垂直同步（与 3dRad 保持一致）：默认 vsync 会把帧率锁死在
+        # 60Hz，大几何拖动时明显"不跟手"。关闭后可达 GPU 实际帧率，
+        # 撕裂由 Windows DWM 合成器吸收。
+        self._set_swap_control(0)
+
         self._setup_default_scene()
         self._scene.renderer.ResetCamera()
         self.render()
@@ -500,6 +505,13 @@ class VtkWidget(QWidget):
         """Alias for render."""
         self.render()
 
+    def _set_swap_control(self, val: int) -> None:
+        """Enable/disable vsync (0=off, 1=on). No-op if backend lacks support."""
+        try:
+            self._vtk_interactor.GetRenderWindow().SetSwapControl(val)
+        except Exception:
+            pass
+
     def set_dark_theme(self, is_dark: bool) -> None:
         """Switch background and toolbar between dark/light."""
         if not self._scene:
@@ -587,19 +599,26 @@ class VtkWidget(QWidget):
         self._clip_plane.SetOrigin(origin)
         self._clip_plane.SetNormal(normal)
 
+        # mapper 已按几何在多实例间共享：按 mapper 去重，避免同一
+        # 裁剪面被重复添加上万次（否则大场景下拖动裁剪滑块会卡顿）
+        seen: set = set()
         for a in self._gdml_actors:
             m = a.GetMapper()
-            if m is None:
+            if m is None or id(m) in seen:
                 continue
+            seen.add(id(m))
             m.RemoveAllClippingPlanes()
             m.AddClippingPlane(self._clip_plane)
         self.render()
 
     def _remove_clip_planes(self):
+        # mapper 已共享，按 mapper 去重移除
+        seen: set = set()
         for a in self._gdml_actors:
             m = a.GetMapper()
-            if m is None:
+            if m is None or id(m) in seen:
                 continue
+            seen.add(id(m))
             m.RemoveAllClippingPlanes()
         self.render()
 

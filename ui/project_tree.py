@@ -10,7 +10,7 @@ Aligns with cad2gdml's ProjectTreeWidget style:
 - Global/Local Materials nodes (reuse from cad2gdml)
 """
 
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QMenu, QMessageBox,
@@ -48,6 +48,10 @@ class ProjectTreeWidget(QWidget):
         self._mat_lib: Optional[MaterialsLib] = None
         self._global_mat_root: Optional[QTreeWidgetItem] = None
         self._local_mat_root: Optional[QTreeWidgetItem] = None
+        # 大几何重建进度：由 main_window 注入，_create_tree_item 每约 128
+        # 个树节点回调一次，保持大文件导入时界面响应。
+        self._tree_progress_cb: Optional[Callable[[int], None]] = None
+        self._tree_progress_done = 0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -256,7 +260,7 @@ class ProjectTreeWidget(QWidget):
         for child in self._geometry_root.takeChildren():
             del child
 
-    def build_from_node_tree(self, root_node: GdmlNode):
+    def build_from_node_tree(self, root_node: GdmlNode, progress_cb=None):
         """
         Build QTreeWidget from GdmlNode tree.
 
@@ -268,17 +272,25 @@ class ProjectTreeWidget(QWidget):
             +-- World (volume hierarchy, no SOLID_DEF children)
                 +-- world_vol
                     +-- ...
+
+        progress_cb: optional callable(done_items:int)。大几何重建时由
+        main_window 注入，每约 128 个树节点回调一次以保持界面响应。
         """
-        self.clear_tree()
+        self._tree_progress_cb = progress_cb
+        self._tree_progress_done = 0
+        try:
+            self.clear_tree()
 
-        for file_node in root_node.children:
-            if file_node.node_type != GdmlNodeType.GDML_FILE:
-                continue
-            file_item = self._create_tree_item(file_node)
-            self._geometry_root.addChild(file_item)
-            self._build_file_tree(file_item, file_node)
+            for file_node in root_node.children:
+                if file_node.node_type != GdmlNodeType.GDML_FILE:
+                    continue
+                file_item = self._create_tree_item(file_node)
+                self._geometry_root.addChild(file_item)
+                self._build_file_tree(file_item, file_node)
 
-        self._geometry_root.setExpanded(True)
+            self._geometry_root.setExpanded(True)
+        finally:
+            self._tree_progress_cb = None
 
     def _build_file_tree(self, file_item: QTreeWidgetItem, file_node: GdmlNode):
         """Build Solids + Assemblies + World groups under a file node."""
@@ -364,6 +376,13 @@ class ProjectTreeWidget(QWidget):
         # Checkbox
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(0, Qt.CheckState.Checked if node.visible else Qt.CheckState.Unchecked)
+
+        # 进度上报（build_from_node_tree 设置了回调时每 128 个回调一次）
+        cb = getattr(self, "_tree_progress_cb", None)
+        if cb is not None:
+            self._tree_progress_done += 1
+            if self._tree_progress_done % 128 == 0:
+                cb(self._tree_progress_done)
 
         return item
 
