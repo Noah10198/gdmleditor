@@ -25,16 +25,25 @@ from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.vtkRenderingCore import (
     vtkRenderer, vtkActor, vtkPolyDataMapper,
 )
-from vtkmodules.vtkRenderingAnnotation import vtkCubeAxesActor, vtkCornerAnnotation
+from vtkmodules.vtkRenderingAnnotation import (
+    vtkCubeAxesActor, vtkCornerAnnotation, vtkAxesActor,
+)
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
 from vtkmodules.vtkCommonDataModel import vtkPlane
 
 # Import VTK backends (needed on Windows)
 import vtkmodules.vtkRenderingOpenGL2
 import vtkmodules.vtkInteractionStyle
+import vtkmodules.vtkRenderingFreeType  # noqa: F401  (corner-axis captions)
 
 from vtk_engine.vtk_scene import VtkScene
 from core.gdml_tree import GdmlNode
+
+# Print GPU info only once globally (all VTK windows share the same GPU).
+# Without this guard every new VtkWidget - e.g. the preview inside the
+# "Redefine World" dialog - would dump the whole OpenGL banner again.
+_GPU_INFO_PRINTED = False
 
 
 # ── VtkWidget ───────────────────────────────────────────────────────
@@ -52,6 +61,21 @@ class VtkWidget(QWidget):
     """
 
     node_picked = pyqtSignal(str)   # Node picked, emits entry_id
+
+    # Background colours, taken from cad2gdml:
+    #   main 3D view   ->  dark grey/navy  (occ_widget.py)
+    #   preview widgets ->  deeper near-black navy (see VtkPreviewWidget)
+    # Both are flat (no gradient) so the picture matches cad2gdml's viewer.
+    BG_DARK: Tuple[float, float, float] = (0.12, 0.12, 0.18)
+    BG_LIGHT: Tuple[float, float, float] = (0.95, 0.95, 0.95)
+
+    # Corner orientation marker (RGB axis trihedron in the lower-right of the
+    # viewport).  Viewport + font size are identical to the ones used by the
+    # RadSim 3D previews (gun direction / voxel result) so every window shows
+    # the same marker.  Preview widgets opt out (see VtkPreviewWidget).
+    ENABLE_CORNER_AXES: bool = True
+    CORNER_AXES_VIEWPORT: Tuple[float, float, float, float] = (0.76, 0.01, 1.0, 0.27)
+    CORNER_AXES_FONT_SIZE: int = 24
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,8 +107,8 @@ class VtkWidget(QWidget):
             self._vtk_interactor.GetRenderWindow().GetInteractor()
         )
 
-        # Dark background
-        self._scene.set_background_color(0.12, 0.12, 0.18)
+        # Dark background (cad2gdml's viewport colour; subclasses may override)
+        self._scene.set_background_color(*self.BG_DARK)
 
         # Proxy picking signal
         self._scene.pick_handler = (
@@ -93,6 +117,7 @@ class VtkWidget(QWidget):
 
         # ── Default actors ──
         self._cube_axes: Optional[vtkCubeAxesActor] = None
+        self._corner_axes: Optional[vtkOrientationMarkerWidget] = None
 
         self._vtk_interactor.Initialize()
 
@@ -103,6 +128,7 @@ class VtkWidget(QWidget):
         # (software/Mesa) if the GPU driver is missing (remote desktop,
         # headless VM, basic display adapter, etc.).
         self._gpu_active = False
+        global _GPU_INFO_PRINTED
         ren_win.SetOffScreenRendering(False)
         try:
             ren_win.Render()
@@ -116,21 +142,23 @@ class VtkWidget(QWidget):
             if m_vdr:
                 self._gpu_info = f"{m_vdr.group(1)} / {m_dev.group(1) if m_dev else '?'}"
                 self._gpu_active = True
-                # Print GPU info in OCC style (matches cad2gdml's Viewer3d)
-                print("#" * 41, flush=True)
-                print("OpenGl information (VTK):", flush=True)
-                print(f"  GLvendor:  {m_vdr.group(1)}", flush=True)
-                print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
-                print(f"  GLversion: {m_ver.group(1) if m_ver else '?'}", flush=True)
-                print(f"  GLSL:      {m_glsl.group(1) if m_glsl else '?'}", flush=True)
-                # Also show pixel format from pixel format descriptor section
-                px_match = _s(
-                    r"(depth:\s+\d+.*?double buffer:\s+\w+)",
-                    raw_caps, _re.DOTALL)
-                if px_match:
-                    for line in px_match.group(1).strip().split("\n"):
-                        print(f"  {line.strip()}", flush=True)
-                print("#" * 41, flush=True)
+                if not _GPU_INFO_PRINTED:
+                    _GPU_INFO_PRINTED = True
+                    # Print GPU info in OCC style (matches cad2gdml's Viewer3d)
+                    print("#" * 41, flush=True)
+                    print("OpenGl information (VTK):", flush=True)
+                    print(f"  GLvendor:  {m_vdr.group(1)}", flush=True)
+                    print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
+                    print(f"  GLversion: {m_ver.group(1) if m_ver else '?'}", flush=True)
+                    print(f"  GLSL:      {m_glsl.group(1) if m_glsl else '?'}", flush=True)
+                    # Also show pixel format from pixel format descriptor section
+                    px_match = _s(
+                        r"(depth:\s+\d+.*?double buffer:\s+\w+)",
+                        raw_caps, _re.DOTALL)
+                    if px_match:
+                        for line in px_match.group(1).strip().split("\n"):
+                            print(f"  {line.strip()}", flush=True)
+                    print("#" * 41, flush=True)
             else:
                 self._gpu_info = "no OpenGL renderer reported"
         except Exception:
@@ -150,23 +178,27 @@ class VtkWidget(QWidget):
                     self._gpu_info = f"{m_vdr.group(1)} / {m_dev.group(1) if m_dev else '?'}{suffix}"
                 else:
                     self._gpu_info = "off-screen (software)"
-                print("#" * 41, flush=True)
-                print("OpenGl information (VTK, off-screen/software):", flush=True)
-                print(f"  GLvendor:  {m_vdr.group(1) if m_vdr else '?'}", flush=True)
-                print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
-                print("#" * 41, flush=True)
+                if not _GPU_INFO_PRINTED:
+                    _GPU_INFO_PRINTED = True
+                    print("#" * 41, flush=True)
+                    print("OpenGl information (VTK, off-screen/software):", flush=True)
+                    print(f"  GLvendor:  {m_vdr.group(1) if m_vdr else '?'}", flush=True)
+                    print(f"  GLdevice:  {m_dev.group(1) if m_dev else '?'}", flush=True)
+                    print("#" * 41, flush=True)
             except Exception:
                 self._gpu_info = "off-screen (no GL)"
             ren_win.SetOffScreenRendering(True)
 
         self._vtk_interactor.Start()
 
-        # 关闭垂直同步（与 3dRad 保持一致）：默认 vsync 会把帧率锁死在
-        # 60Hz，大几何拖动时明显"不跟手"。关闭后可达 GPU 实际帧率，
-        # 撕裂由 Windows DWM 合成器吸收。
+        # Vertical sync off (same as 3dRad): the default vsync locks the frame
+        # rate at 60 Hz, which feels laggy when dragging a large geometry.
+        # Without it the GPU can hit its real frame rate; tearing is absorbed
+        # by the Windows DWM compositor.
         self._set_swap_control(0)
 
         self._setup_default_scene()
+        self._init_corner_axes()
         self._scene.renderer.ResetCamera()
         self.render()
 
@@ -453,6 +485,62 @@ class VtkWidget(QWidget):
         self._cube_axes.SetBounds(bounds)
         self._clip_bounds = bounds
 
+    # ── Corner orientation marker ──
+
+    def _init_corner_axes(self) -> None:
+        """Fixed-size RGB axis trihedron in the lower-right viewport corner.
+
+        Uses the same recipe as the RadSim 3D previews (gun direction / voxel
+        result): a `vtkAxesActor` inside a `vtkOrientationMarkerWidget`, so the
+        marker looks identical in every Easy2Rad window.  The marker lives in
+        its own renderer/viewport, so it is unaffected by zooming, panning or
+        Fit/Reset-camera and never shows up in the scene's actor lists.
+        """
+        if not self.ENABLE_CORNER_AXES or self._corner_axes is not None:
+            return
+        try:
+            ax = vtkAxesActor()
+            ax.SetTotalLength(1.0, 1.0, 1.0)
+            ax.SetAxisLabels(1)
+
+            omw = vtkOrientationMarkerWidget()
+            omw.SetOrientationMarker(ax)
+            omw.SetInteractor(self._vtk_interactor.GetRenderWindow().GetInteractor())
+            omw.SetViewport(*self.CORNER_AXES_VIEWPORT)
+            # Order matters: "Enabled" must come before touching the
+            # interactivity flag, otherwise VTK prints
+            #   "Set interactor and Enabled before changing interaction."
+            omw.SetEnabled(1)
+            # View-only marker: it must not swallow the mouse in its corner.
+            omw.InteractiveOff()
+            self._corner_axes = omw
+            self._style_corner_axes(True)
+        except Exception as e:
+            # A missing widget class / GL context must not break the main window
+            self._corner_axes = None
+            print(f"[VtkWidget] corner axes unavailable: {e}", flush=True)
+
+    def _style_corner_axes(self, is_dark: bool) -> None:
+        """Paint the X / Y / Z captions in the inverse of the scene background
+        (white on the dark scene, near-black on the light one) so the letters
+        stay readable in either theme."""
+        omw = self._corner_axes
+        if omw is None:
+            return
+        try:
+            ax = omw.GetOrientationMarker()
+            lab = (1.0, 1.0, 1.0) if is_dark else (0.08, 0.08, 0.12)
+            for cap in (ax.GetXAxisCaptionActor2D(),
+                        ax.GetYAxisCaptionActor2D(),
+                        ax.GetZAxisCaptionActor2D()):
+                tp = cap.GetCaptionTextProperty()
+                tp.SetColor(*lab)
+                tp.SetShadow(0)
+                tp.ItalicOff()
+                tp.SetFontSize(self.CORNER_AXES_FONT_SIZE)
+        except Exception:
+            pass
+
     # ── Public API ──
 
     def get_scene(self) -> VtkScene:
@@ -482,6 +570,33 @@ class VtkWidget(QWidget):
         """Set placement override provider on the scene (forwarded from agent)."""
         if self._scene:
             self._scene.set_override_provider(provider)
+
+    def refresh_placement(self, node: GdmlNode) -> int:
+        """Re-apply placements for a subtree WITHOUT rebuilding the scene.
+
+        Live transform-preview path: geometry, selection highlight, current
+        opacity/edges and the camera are all left untouched - only the actors
+        under `node` get their position/orientation recomputed. The coordinate
+        axes bounds and the clipping range are refreshed afterwards so the
+        moved geometry does not fall outside them.
+
+        Args:
+            node: PHYVOL_NODE (placement override) or GDML_FILE (file
+                transform) whose subtree is affected.
+
+        Returns:
+            Number of actors updated (0 means nothing was affected).
+        """
+        if not self._scene:
+            return 0
+        updated = self._scene.refresh_placement(node)
+        if updated == 0:
+            return 0
+        if self._cube_axes is not None:
+            self._update_cube_axes_bounds()
+        self._scene.renderer.ResetCameraClippingRange()
+        self.render()
+        return updated
 
     def _collect_gdml_actors(self):
         """Collect all GDML actors (non-default) for color/opacity management."""
@@ -516,15 +631,19 @@ class VtkWidget(QWidget):
         """Switch background and toolbar between dark/light."""
         if not self._scene:
             return
-        if is_dark:
-            self._scene.set_background_color(0.12, 0.12, 0.18)
-        else:
-            self._scene.set_background_color(0.95, 0.95, 0.95)
+        self._scene.set_background_color(*(self.BG_DARK if is_dark
+                                          else self.BG_LIGHT))
+        self._style_corner_axes(is_dark)
         self._apply_toolbar_style(is_dark)
         self.render()
 
     def cleanup(self) -> None:
         """Clean up VTK resources."""
+        try:
+            if self._corner_axes is not None:
+                self._corner_axes.EnabledOff()
+        except Exception:
+            pass
         try:
             self._vtk_interactor.TerminateApp()
         except Exception:
@@ -599,8 +718,9 @@ class VtkWidget(QWidget):
         self._clip_plane.SetOrigin(origin)
         self._clip_plane.SetNormal(normal)
 
-        # mapper 已按几何在多实例间共享：按 mapper 去重，避免同一
-        # 裁剪面被重复添加上万次（否则大场景下拖动裁剪滑块会卡顿）
+        # Mappers are shared between instances of the same geometry, so
+        # de-duplicate by mapper: adding the same clipping plane tens of
+        # thousands of times would make the clip slider stutter on big scenes.
         seen: set = set()
         for a in self._gdml_actors:
             m = a.GetMapper()
@@ -612,7 +732,7 @@ class VtkWidget(QWidget):
         self.render()
 
     def _remove_clip_planes(self):
-        # mapper 已共享，按 mapper 去重移除
+        # Mappers are shared - de-duplicate by mapper, same as above
         seen: set = set()
         for a in self._gdml_actors:
             m = a.GetMapper()
@@ -648,6 +768,14 @@ class VtkWidget(QWidget):
             cam.Dolly(1.2)
             self._scene.renderer.ResetCameraClippingRange()
             self.render()
+
+    def fit_all(self) -> None:
+        """Fit the camera to everything currently visible (public API).
+
+        Dispatches to the subclass' `_fit_all`, so `VtkPreviewWidget` gets its
+        own lighter version.
+        """
+        self._fit_all()
 
     def _set_axis_view(self, axis: int):
         if not self._scene or not self._clip_bounds:
@@ -687,6 +815,21 @@ class VtkWidget(QWidget):
 class VtkPreviewWidget(VtkWidget):
     """Minimal VTK preview widget — no toolbar, no clip, just the scene + CubeAxes."""
 
+    # Dialogs keep their current look: no corner marker (the RadSim previews
+    # build their own when they need one).
+    ENABLE_CORNER_AXES: bool = False
+
+    # cad2gdml paints the viewport of its preview dialogs (Export GDML,
+    # Interference) with this deeper near-black navy instead of the main
+    # viewer's (0.12, 0.12, 0.18).  Same family, one step darker, so the
+    # preview reads as a "picture" inside the dialog.
+    BG_DARK: Tuple[float, float, float] = (0.08, 0.08, 0.12)
+
+    # Light mode: a mid grey instead of the main viewer's near-white
+    # (0.95, 0.95, 0.95), so the preview viewport still reads as a distinct
+    # picture inside an otherwise light dialog.
+    BG_LIGHT: Tuple[float, float, float] = (0.60, 0.60, 0.60)
+
     def _build_ui(self):
         """Build minimal layout: VTK viewport only (no toolbar)."""
         layout = QVBoxLayout(self)
@@ -715,10 +858,9 @@ class VtkPreviewWidget(VtkWidget):
             self.render()
 
     def set_dark_theme(self, is_dark: bool) -> None:
+        # Toolbar styling is skipped on purpose: this widget has no toolbar
         if not self._scene:
             return
-        if is_dark:
-            self._scene.set_background_color(0.12, 0.12, 0.18)
-        else:
-            self._scene.set_background_color(0.95, 0.95, 0.95)
+        self._scene.set_background_color(*(self.BG_DARK if is_dark
+                                          else self.BG_LIGHT))
         self.render()

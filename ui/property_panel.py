@@ -138,6 +138,10 @@ class PropertyPanel(QWidget):
         if hasattr(self, '_scroll') and self._scroll:
             self._scroll.viewport().setStyleSheet(f"background-color: {bg};")
 
+    def get_current_node(self) -> Optional[GdmlNode]:
+        """Node currently displayed (None for material views / empty panel)."""
+        return self._current_node
+
     def show_node(self, node: Optional[GdmlNode]):
         """Display node properties"""
         self._current_node = node

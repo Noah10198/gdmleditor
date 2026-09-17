@@ -34,6 +34,7 @@ from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 
 from core.gdml_tree import GdmlNode, GdmlNodeType, Placement
+from vtk_engine import WORLD_BOX_COLOR
 
 
 class VtkSolidFactory:
@@ -106,9 +107,14 @@ class VtkSolidFactory:
         actor.SetMapper(mapper)
 
         # Set color by volume identity (name or entry_id) — each physical body
-        # gets its own color independent of shared material names
+        # gets its own color independent of shared material names.  The world
+        # volume is a reference frame rather than a body, so it keeps the
+        # shared world-box yellow (same as the unified box / preview).
         color_key = node.entry_id if node.entry_id else node.name
-        color = self._get_color_for_node(color_key)
+        if node.node_type == GdmlNodeType.WORLD_NODE:
+            color = WORLD_BOX_COLOR
+        else:
+            color = self._get_color_for_node(color_key)
         actor.GetProperty().SetColor(*color)
 
         # ── Material properties for realistic shading ──

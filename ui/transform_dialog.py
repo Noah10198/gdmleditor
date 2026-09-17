@@ -7,9 +7,14 @@ Supports two modes:
    (translates/rotates all geometry in the file as a single group)
 
 Usage:
-    dialog = TransformDialog(entry_id, initial_placement, title, parent)
+    dialog = TransformDialog(title, target_label, initial_placement, parent)
     if dialog.exec() == QDialog.DialogCode.Accepted:
         new_placement = dialog.get_placement()
+
+    # Live preview: connect placement_changed() and the caller may show the
+    # edit in the 3D view while the dialog is still open. The caller is then
+    # responsible for reverting its own state if exec() does not return
+    # Accepted (Cancel / Esc / window close).
 """
 
 from typing import Optional
@@ -18,13 +23,22 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QDoubleSpinBox, QPushButton, QGroupBox, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 from core.gdml_tree import Placement
 
 
 class TransformDialog(QDialog):
-    """Dialog for editing position and rotation values."""
+    """Dialog for editing position and rotation values.
+
+    Emits `placement_changed(Placement)` on every edit (typing, arrow keys,
+    mouse wheel) so the caller can preview it live. The signal is advisory
+    only - the dialog itself keeps no side effects on the scene, so the
+    caller owns commit/revert.
+    """
+
+    #: Current spinbox values, emitted on every change. object = Placement
+    placement_changed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -52,7 +66,11 @@ class TransformDialog(QDialog):
             unit=placement.unit, rot_unit=placement.rot_unit,
         )
 
+        # Gate for placement_changed: the initial setValue() calls during
+        # _build_ui must not look like user edits.
+        self._ready = False
         self._build_ui(target_label)
+        self._ready = True
 
     def _build_ui(self, target_label: str):
         layout = QVBoxLayout(self)
@@ -80,6 +98,7 @@ class TransformDialog(QDialog):
             spin.setDecimals(4)
             spin.setSingleStep(1.0)
             spin.setValue(val)
+            spin.valueChanged.connect(self._on_value_changed)
             unit_label = QLabel(self._placement.unit)
             pos_grid.addWidget(label, i, 0)
             pos_grid.addWidget(spin, i, 1)
@@ -109,6 +128,7 @@ class TransformDialog(QDialog):
             spin.setDecimals(2)
             spin.setSingleStep(1.0)
             spin.setValue(val)
+            spin.valueChanged.connect(self._on_value_changed)
             unit_label = QLabel(self._placement.rot_unit)
             rot_grid.addWidget(label, i, 0)
             rot_grid.addWidget(spin, i, 1)
@@ -147,6 +167,20 @@ class TransformDialog(QDialog):
             unit=self._placement.unit,
             rot_unit=self._placement.rot_unit,
         )
+
+    def _on_value_changed(self, _value: float = 0.0):
+        """Spinbox changed (typing, arrows or wheel) -> live preview."""
+        if not self._ready:
+            return
+        self.placement_changed.emit(self._read_spinboxes())
+
+    def current_placement(self) -> Placement:
+        """Live spinbox values, valid while the dialog is still open.
+
+        Unlike get_placement(), this does not depend on the dialog having
+        been accepted - used by the live preview / revert logic.
+        """
+        return self._read_spinboxes()
 
     def _on_accept(self):
         """Validate and accept."""

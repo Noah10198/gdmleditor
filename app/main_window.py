@@ -572,8 +572,21 @@ class MainWindow(QMainWindow):
             self._vtk_widget.refresh()
         self._logger.log_system("View reset")
 
+    def _refresh_world_selection(self, world_nodes) -> None:
+        """Re-show the selected node so the panel reflects the new world size."""
+        cur = self._property_panel.get_current_node()
+        if cur is None:
+            return
+        affected = set()
+        for w in world_nodes:
+            affected.add(w.entry_id)
+            for d in w.get_all_descendants():
+                affected.add(d.entry_id)
+        if cur.entry_id in affected:
+            self._property_panel.show_node(cur)
+
     def _on_redefine_world(self):
-        """Redefine world volume size"""
+        """Redefine world volume size (with live 3D preview in the dialog)."""
         # Get all world nodes
         world_nodes = self._gdml_agent.get_world_nodes()
         if not world_nodes:
@@ -581,8 +594,17 @@ class MainWindow(QMainWindow):
                 "No world volume found.\nImport a GDML file first.")
             return
 
-        # Compute global bounding box
-        bbox = self._gdml_agent.compute_scene_bbox()
+        # Bounding box of what is actually rendered: VTK already baked in
+        # physvol placements, rotations, file transforms and every solid type
+        # (box / tube / tessellated / ...). The world boxes themselves are
+        # excluded so they don't measure themselves. Fall back to the
+        # analytical estimate when the scene is empty.
+        scene = self._vtk_widget.get_scene() if self._vtk_widget else None
+        world_ids = {w.entry_id for w in world_nodes}
+        bbox = (scene.get_geometry_bounds(exclude_entry_ids=world_ids)
+                if scene is not None else None)
+        if bbox is None:
+            bbox = self._gdml_agent.compute_scene_bbox()
         xmin, xmax, ymin, ymax, zmin, zmax = bbox
         has_scene = not (xmin == xmax == ymin == ymax == zmin == zmax == 0)
 
@@ -592,11 +614,20 @@ class MainWindow(QMainWindow):
                 "Import a GDML file with solid volumes first.")
             return
 
-        # Current world size (from first world node)
-        first_world = world_nodes[0]
-        cur_size = first_world.solid_params.get('x', 0)
+        # Current world size(s): one entry per world node, so the dialog can
+        # flag a mismatch (multi-file mode where files were resized apart)
+        world_sizes = [w.solid_params.get('x', 0.0) for w in world_nodes]
+        cur_size = world_sizes[0] if world_sizes else 0.0
 
-        dialog = RedefineWorldDialog(bbox, cur_size, self)
+        root = self._gdml_agent.get_root_node()
+        dialog = RedefineWorldDialog(
+            bbox, cur_size, root_node=root, parent=self,
+            world_count=len(world_nodes), current_world_sizes=world_sizes,
+            dark_theme=self._dark_theme,
+            # Same overrides as the main view, so the preview geometry lines up
+            # with the bbox measured above (which already includes them).
+            override_provider=(
+                lambda entry_id: self._gdml_agent.get_placement_override(entry_id)))
         if dialog.exec() == QDialog.DialogCode.Accepted:
             half = dialog.world_half_size
             full = half * 2.0
@@ -605,16 +636,20 @@ class MainWindow(QMainWindow):
             for wnode in world_nodes:
                 self._gdml_agent.set_world_size(wnode, half)
 
-            # Rebuild scene
-            root = self._gdml_agent.get_root_node()
+            # ── Linked updates: 3D view, property panel, status bar ──
             if self._vtk_widget:
                 self._vtk_widget.build_scene(root)
+            self._refresh_world_selection(world_nodes)
 
+            # Multi-file mode resizes every file's world at once - say so
+            worlds_note = (f", {len(world_nodes)} world volumes"
+                           if len(world_nodes) > 1 else "")
             self._logger.log_system(
                 f"World volume redefined: {full:.1f} × {full:.1f} × {full:.1f} mm "
-                f"(factor ×{dialog.selected_factor})")
+                f"(factor ×{dialog.selected_factor}{worlds_note})")
             self._status_label.setText(
-                f"World: {full:.1f} × {full:.1f} × {full:.1f} mm")
+                f"World: {full:.1f} × {full:.1f} × {full:.1f} mm"
+                + (f"  ({len(world_nodes)} files)" if len(world_nodes) > 1 else ""))
 
     def _on_help(self):
         """Show help information"""
@@ -828,12 +863,16 @@ class MainWindow(QMainWindow):
 
         # Determine transform target: for VOLUME_NODE instances under a PHYVOL,
         # the actual placement lives on the parent PHYVOL_NODE.
+        is_file_transform = (node.node_type == GdmlNodeType.GDML_FILE)
         if (node.node_type == GdmlNodeType.VOLUME_NODE
                 and node.parent
                 and node.parent.node_type == GdmlNodeType.PHYVOL_NODE):
             # Edit the parent physvol's placement
             physvol = node.parent
             target_entry_id = physvol.entry_id
+            # Subtree to refresh for the live preview: the PHYVOL_NODE, since
+            # every actor below it accumulates this placement.
+            refresh_root = physvol
             # Show current (possibly overridden) value in the dialog
             override = self._gdml_agent.get_placement_override(target_entry_id)
             placement = override if override else (physvol.placement or Placement())
@@ -843,6 +882,8 @@ class MainWindow(QMainWindow):
         elif node.node_type == GdmlNodeType.GDML_FILE:
             # Edit file-level transform
             target_entry_id = node.entry_id
+            # The whole file subtree moves, except the world box itself
+            refresh_root = node
             placement = node.file_transform or Placement()
             title = "Edit File Transform"
             target_label = "File: " + (node.name if node.name else "unnamed")
@@ -858,22 +899,64 @@ class MainWindow(QMainWindow):
             return
 
         dialog = TransformDialog(title, target_label, placement, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_placement = dialog.get_placement()
-            if node.node_type == GdmlNodeType.GDML_FILE:
-                # Apply file-level transform and refresh scene only
-                node.file_transform = Placement(
-                    x=new_placement.x, y=new_placement.y, z=new_placement.z,
-                    rot_x=new_placement.rot_x, rot_y=new_placement.rot_y,
-                    rot_z=new_placement.rot_z,
-                )
+
+        # ── Live preview ──
+        # The dialog is modal, but the 3D view stays visible behind it, so the
+        # edit can be shown while the user types / scrolls. Only the affected
+        # subtree is refreshed (VtkWidget.refresh_placement): geometry, mapper,
+        # selection highlight and the camera are all preserved, i.e. no full
+        # scene rebuild. Whatever the preview pushed into the model is reverted
+        # when the dialog is not accepted, so the model is never left
+        # half-edited (Cancel / Esc / closing the window all land here).
+        prev_file_transform = (refresh_root.file_transform
+                               if is_file_transform else None)
+        prev_override = self._gdml_agent.get_placement_override(target_entry_id)
+
+        def apply_placement(p: Placement) -> int:
+            """Push `p` into the model and refresh only the affected actors."""
+            if is_file_transform:
+                # File-level transform is stored on the node itself
+                refresh_root.file_transform = Placement(
+                    x=p.x, y=p.y, z=p.z,
+                    rot_x=p.rot_x, rot_y=p.rot_y, rot_z=p.rot_z)
             else:
-                # Apply placement override (lives in agent's _placement_overrides)
+                # Placement override (lives in agent's _placement_overrides)
+                self._gdml_agent.set_placement_override(target_entry_id, p)
+            if self._vtk_widget is None:
+                return 0
+            return self._vtk_widget.refresh_placement(refresh_root)
+
+        # Debounce: one spinbox step with the wheel or holding a key must not
+        # trigger one repaint each - only the last value of the burst matters.
+        preview_timer = QTimer(self)
+        preview_timer.setSingleShot(True)
+        preview_timer.setInterval(60)
+        preview_timer.timeout.connect(
+            lambda: apply_placement(dialog.current_placement()))
+        dialog.placement_changed.connect(lambda _p: preview_timer.start())
+
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        preview_timer.stop()
+        preview_timer.deleteLater()
+
+        if accepted:
+            # Commit the spinbox values as they are now. This is also the only
+            # apply for "opened the dialog and pressed OK without editing",
+            # where placement_changed never fired.
+            updated = apply_placement(dialog.get_placement())
+            self._logger.log_system(
+                f"Transform applied: {updated} actor(s) updated")
+        else:
+            # Cancel: undo the live preview to the pre-dialog state
+            if is_file_transform:
+                refresh_root.file_transform = prev_file_transform
+            elif prev_override is not None:
                 self._gdml_agent.set_placement_override(
-                    target_entry_id, new_placement)
-            # Rebuild only the scene (tree structure is unchanged)
-            root = self._gdml_agent.get_root_node()
-            self._vtk_widget.build_scene(root)
+                    target_entry_id, prev_override)
+            else:
+                self._gdml_agent.clear_placement_override(target_entry_id)
+            if self._vtk_widget:
+                self._vtk_widget.refresh_placement(refresh_root)
 
     def _on_node_picked(self, entry_id: str):
         """Node picked in 3D view"""

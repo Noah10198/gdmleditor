@@ -33,6 +33,7 @@ from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 from vtkmodules.vtkFiltersSources import vtkCubeSource
 
 from core.gdml_tree import GdmlNode, GdmlNodeType, Placement
+from vtk_engine import WORLD_BOX_COLOR
 from vtk_engine.vtk_solid_factory import VtkSolidFactory
 
 
@@ -53,6 +54,12 @@ class VtkScene:
         # entry_id -> vtkActor mapping
         self._actor_map: Dict[str, vtkActor] = {}
 
+        # World reference box actors: one per WORLD_NODE, plus the single
+        # unified box drawn in multi-file mode. Kept separately so the
+        # "Redefine World" preview can re-size just the world box instead of
+        # rebuilding the whole tree (a full rebuild is expensive on big scenes).
+        self._world_box_actors: List[vtkActor] = []
+
         # Selected entry_id
         self._selected_id: Optional[str] = None
         self._selected_actor: Optional[vtkActor] = None
@@ -66,8 +73,9 @@ class VtkScene:
         self._pick_handler: Optional[Callable[[str], None]] = None
         self._picker = vtkCellPicker()
 
-        # 大几何场景构建的进度回调：callable(done_nodes:int)，纯 Python、
-        # 不依赖 Qt，由 UI 层注入（用于大文件导入时保持界面响应）。
+        # Progress callback for large scene builds: callable(done_nodes: int),
+        # plain Python (no Qt), injected by the UI layer to keep the window
+        # responsive while importing big files.
         self._build_progress_cb: Optional[Callable[[int], None]] = None
         self._build_counter = 0
 
@@ -153,6 +161,8 @@ class VtkScene:
 
         self._actor_map[node.entry_id] = actor
         self._renderer.AddActor(actor)
+        if node.node_type == GdmlNodeType.WORLD_NODE:
+            self._world_box_actors.append(actor)
         return actor
 
     def remove_node(self, entry_id: str) -> bool:
@@ -172,9 +182,15 @@ class VtkScene:
     def clear(self):
         """Clear scene"""
         self._actor_map.clear()
+        self._world_box_actors.clear()
         self._renderer.RemoveAllViewProps()
         self._selected_id = None
         self._selected_actor = None
+
+    @property
+    def world_box_actors(self) -> List[vtkActor]:
+        """World reference box actors (per WORLD_NODE boxes / unified box)."""
+        return list(self._world_box_actors)
 
     # ==================== Selection & Highlight ====================
 
@@ -400,8 +416,12 @@ class VtkScene:
         # VTK's SetOrientation is an ACTIVE (object) rotation.
         # The two are inverses of each other, so GDML values must be
         # negated to produce the correct visual result.
-        if abs(rx) > 0.001 or abs(ry) > 0.001 or abs(rz) > 0.001:
-            actor.SetOrientation(-rx, -ry, -rz)
+        # NOTE: set it unconditionally, even for all-zero. Fresh actors from
+        # a rebuild default to (0,0,0) so this is a no-op for them, but this
+        # method is also used to refresh an existing actor in place (live
+        # transform preview) - an actor that was rotated must be able to
+        # return to zero instead of keeping its previous orientation.
+        actor.SetOrientation(-rx, -ry, -rz)
 
     def update_placement(self, node: GdmlNode):
         """Update node placement"""
@@ -409,6 +429,38 @@ class VtkScene:
         if actor is None:
             return
         self._apply_node_placement(actor, node)
+
+    def refresh_placement(self, node: GdmlNode) -> int:
+        """
+        Re-apply placements for `node` and all its descendants, in place.
+
+        Changing a physvol placement (or a file-level transform) only moves
+        actors that have this node in their ancestor chain - because
+        _apply_node_placement accumulates placements by walking parents - so
+        the affected set is exactly this subtree. Geometry (polydata/mapper)
+        is reused and the camera is left alone, which makes this cheap enough
+        to run on every spinbox change even on large scenes, unlike a full
+        build_from_tree() rebuild.
+
+        Args:
+            node: the node whose subtree is affected (PHYVOL_NODE for a
+                physvol placement override, GDML_FILE for a file transform).
+
+        Returns:
+            Number of actors whose placement was updated.
+        """
+        updated = 0
+        actor = self._actor_map.get(node.entry_id)
+        if actor is not None:
+            self._apply_node_placement(actor, node)
+            updated += 1
+        # get_all_descendants() excludes the node itself, hence the above.
+        for child in node.get_all_descendants():
+            child_actor = self._actor_map.get(child.entry_id)
+            if child_actor is not None:
+                self._apply_node_placement(child_actor, child)
+                updated += 1
+        return updated
 
     # ==================== Picking ====================
 
@@ -463,11 +515,11 @@ class VtkScene:
     # ==================== Scene building ====================
 
     def set_build_progress_callback(self, cb: Optional[Callable[[int], None]]):
-        """设置大场景构建进度回调（UI 层注入）；传 None 清除。"""
+        """Set the large-scene build progress callback; None clears it."""
         self._build_progress_cb = cb
 
     def _bump_build_progress(self):
-        """每处理一个树节点计数，约每 256 节点上报一次进度。"""
+        """Count processed tree nodes; report roughly every 256 of them."""
         cb = self._build_progress_cb
         if cb is None:
             return
@@ -489,7 +541,8 @@ class VtkScene:
         """
         self.clear()
         self._build_counter = 0
-        # 树整体重建：先清几何缓存，避免旧树对象销毁后 id 复用导致错配
+        # Full tree rebuild: drop the geometry cache first, otherwise reused
+        # object ids from destroyed tree nodes can map to stale actors.
         self._solid_factory.clear_cache()
 
         if not root_node.children:
@@ -508,8 +561,8 @@ class VtkScene:
                 file_node, render_all_volumes=render_all_volumes,
                 _world_rendered=[True] if unified else None)
 
-        # In unified mode: use the Redefine World size (all world nodes match)
-        # centered at the midpoint of all geometry.
+        # In unified mode: replace the per-file world boxes with a single one
+        # using the Redefine World size (all world nodes share it).
         if unified:
             first_world = self._find_first_world(root_node)
             rdx = rdy = rdz = 1000.0
@@ -519,29 +572,14 @@ class VtkScene:
                 rdy = p.get('y', 1000)
                 rdz = p.get('z', 1000)
 
-            # Compute the exact bounding box of all geometry for centering
-            bounds = [float('inf'), float('-inf'),
-                      float('inf'), float('-inf'),
-                      float('inf'), float('-inf')]
-            has_geo = False
-            for actor in self._actor_map.values():
-                b = actor.GetBounds()
-                if b and b[1] >= b[0]:
-                    has_geo = True
-                    if b[0] < bounds[0]: bounds[0] = b[0]
-                    if b[1] > bounds[1]: bounds[1] = b[1]
-                    if b[2] < bounds[2]: bounds[2] = b[2]
-                    if b[3] > bounds[3]: bounds[3] = b[3]
-                    if b[4] < bounds[4]: bounds[4] = b[4]
-                    if b[5] > bounds[5]: bounds[5] = b[5]
-
-            if has_geo:
-                cx = (bounds[0] + bounds[1]) * 0.5
-                cy = (bounds[2] + bounds[3]) * 0.5
-                cz = (bounds[4] + bounds[5]) * 0.5
-                self._add_world_box(rdx, rdy, rdz, cx, cy, cz)
-            else:
-                self._add_world_box(rdx, rdy, rdz)
+            # The unified box is centred on the origin because:
+            #  - that matches the exported GDML (a box solid is always
+            #    origin-centred);
+            #  - it matches where a WORLD_NODE box is drawn in single-file mode;
+            #  - it matches the RedefineWorldDialog contract of
+            #    half = max_distance_from_origin * factor, which guarantees the
+            #    box encloses every piece of geometry.
+            self._add_world_box(rdx, rdy, rdz)
 
         self.reset_camera()
         self.render()
@@ -643,16 +681,59 @@ class VtkScene:
         actor = vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetRepresentationToWireframe()
-        actor.GetProperty().SetColor(0.3, 0.8, 1.0)
+        actor.GetProperty().SetColor(*WORLD_BOX_COLOR)
         actor.GetProperty().SetLineWidth(2)
         transform = vtkTransform()
         transform.Translate(cx, cy, cz)
         actor.SetUserTransform(transform)
         self._renderer.AddActor(actor)
+        self._world_box_actors.append(actor)
 
     def get_actor_for_node(self, entry_id: str) -> Optional[vtkActor]:
         """Get actor for a given node"""
         return self._actor_map.get(entry_id)
+
+    def get_geometry_bounds(
+        self,
+        exclude_entry_ids: Optional[set] = None,
+    ) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """
+        World-space AABB of everything currently rendered.
+
+        Uses the bounds VTK already computed per actor, so every solid type
+        (box / tube / tessellated / ...) is handled the same way and the
+        result already includes physvol placements, rotations and GDML
+        file transforms.  Nothing is re-derived from solid_params.
+
+        Args:
+            exclude_entry_ids: entry_ids to skip. Pass the WORLD_NODE ids so
+                the world box does not measure itself.
+
+        Returns:
+            (xmin, xmax, ymin, ymax, zmin, zmax), or None if nothing is drawn.
+        """
+        skip = exclude_entry_ids or ()
+        world_actors = {id(a) for a in self._world_box_actors}
+        bounds = [float('inf'), float('-inf'),
+                  float('inf'), float('-inf'),
+                  float('inf'), float('-inf')]
+        has_geo = False
+        for entry_id, actor in self._actor_map.items():
+            if entry_id in skip or id(actor) in world_actors:
+                continue
+            b = actor.GetBounds()
+            if not b or b[1] < b[0]:
+                continue
+            has_geo = True
+            for k in range(6):
+                if k % 2 == 0:
+                    bounds[k] = min(bounds[k], b[k])
+                else:
+                    bounds[k] = max(bounds[k], b[k])
+        if not has_geo:
+            return None
+        return (bounds[0], bounds[1], bounds[2],
+                bounds[3], bounds[4], bounds[5])
 
     @property
     def renderer(self) -> vtkRenderer:
