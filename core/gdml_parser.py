@@ -355,7 +355,13 @@ class GdmIParser:
         triangles: List[Tuple[str, str, str]] = []            # (v1, v2, v3) name refs
         quadrangles: List[Tuple[str, str, str, str]] = []     # (v1, v2, v3, v4)
 
-        vertex_names: set = set()
+        # Dict used as an insertion-ordered set: the vertex order must follow
+        # first appearance in the file.  A plain set() iterates in
+        # PYTHONHASHSEED order, so the point numbering of the same solid came
+        # out different on every run.  That is not cosmetic - the intersection
+        # filter's Delaunay step is order sensitive, and some orderings turned
+        # a 36 ms pair into one that never finished.
+        vertex_names: Dict[str, None] = {}
         for child in elem:
             if child.tag == "triangular":
                 v1 = child.get("vertex1", "")
@@ -363,7 +369,8 @@ class GdmIParser:
                 v3 = child.get("vertex3", "")
                 if v1 and v2 and v3:
                     triangles.append((v1, v2, v3))
-                    vertex_names.update((v1, v2, v3))
+                    for v in (v1, v2, v3):
+                        vertex_names[v] = None
             elif child.tag == "quadrangular":
                 v1 = child.get("vertex1", "")
                 v2 = child.get("vertex2", "")
@@ -371,7 +378,8 @@ class GdmIParser:
                 v4 = child.get("vertex4", "")
                 if v1 and v2 and v3 and v4:
                     quadrangles.append((v1, v2, v3, v4))
-                    vertex_names.update((v1, v2, v3, v4))
+                    for v in (v1, v2, v3, v4):
+                        vertex_names[v] = None
 
         # Resolve vertex coordinates from global positions
         resolved_vertices: Dict[str, Tuple[float, float, float]] = {}

@@ -34,6 +34,11 @@ from ui.assign_material_dialog import AssignMaterialDialog
 from ui.local_material_dialog import LocalMaterialDialog
 from ui.interference_panel import InterferencePanel
 from ui.transform_dialog import TransformDialog
+from ui.detector_dialog import DetectorDialog
+from core.detector_factory import (
+    BOX, SPHERE, SHAPES, build_detector_file_node,
+    collect_existing_names, format_size_text, make_unique_name,
+)
 from core.gdml_tree import Placement
 
 
@@ -66,6 +71,88 @@ class _ImportWorker(QObject):
         self.all_done.emit()
 
 
+class _TransformSession:
+    """State for one open (non-modal) TransformDialog.
+
+    TransformDialog used to run in exec(), so the pre-edit snapshot, the
+    debounce timer and the commit/revert branch could all be locals of
+    `_on_transform_requested`. Now that the dialog is non-modal that method
+    returns as soon as the window is shown, so the very same state has to be
+    kept alive out here - including a reference to the dialog, otherwise it is
+    garbage collected the moment the event loop comes back.
+    """
+
+    #: Live-preview debounce: one repaint per wheel/key burst, not per step.
+    PREVIEW_INTERVAL_MS = 60
+
+    def __init__(self, owner, dialog, target_entry_id, refresh_root,
+                 is_file_transform, prev_file_transform, prev_override):
+        self.owner = owner
+        self.dialog = dialog
+        self.target_entry_id = target_entry_id
+        self.refresh_root = refresh_root
+        self.is_file_transform = is_file_transform
+        self.prev_file_transform = prev_file_transform
+        self.prev_override = prev_override
+        self.timer: Optional[QTimer] = None
+        #: Set when the application itself closes the dialog (tree rebuild);
+        #: the finished handler must then leave the model untouched.
+        self.superseded = False
+
+    def start_preview(self):
+        """Wire placement_changed -> debounced live preview into the model."""
+        self.timer = QTimer(self.owner)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(self.PREVIEW_INTERVAL_MS)
+        self.timer.timeout.connect(
+            lambda: self.apply_placement(self.dialog.current_placement()))
+        self.dialog.placement_changed.connect(lambda _p: self.timer.start())
+
+    def stop_preview(self):
+        """Drop the debounce timer (a pending tick must not fire afterwards)."""
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer.deleteLater()
+            self.timer = None
+
+    def _is_stale(self) -> bool:
+        """True when the tree was rebuilt while the dialog was open."""
+        return (self.owner._gdml_agent.get_node_by_entry_id(self.target_entry_id)
+                is not self.refresh_root)
+
+    def apply_placement(self, p: Placement) -> int:
+        """Push `p` into the model and refresh only the affected actors."""
+        if self.superseded or self._is_stale():
+            return 0
+        if self.is_file_transform:
+            # File-level transform is stored on the node itself
+            self.refresh_root.file_transform = Placement(
+                x=p.x, y=p.y, z=p.z,
+                rot_x=p.rot_x, rot_y=p.rot_y, rot_z=p.rot_z)
+        else:
+            # Placement override (lives in agent's _placement_overrides)
+            self.owner._gdml_agent.set_placement_override(
+                self.target_entry_id, p)
+        if self.owner._vtk_widget is None:
+            return 0
+        return self.owner._vtk_widget.refresh_placement(self.refresh_root)
+
+    def revert(self):
+        """Undo whatever the live preview pushed into the model."""
+        if self.superseded or self._is_stale():
+            return
+        if self.is_file_transform:
+            self.refresh_root.file_transform = self.prev_file_transform
+        elif self.prev_override is not None:
+            self.owner._gdml_agent.set_placement_override(
+                self.target_entry_id, self.prev_override)
+        else:
+            self.owner._gdml_agent.clear_placement_override(
+                self.target_entry_id)
+        if self.owner._vtk_widget:
+            self.owner._vtk_widget.refresh_placement(self.refresh_root)
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -83,6 +170,14 @@ class MainWindow(QMainWindow):
         # Background import tracking
         self._import_thread: Optional[QThread] = None
         self._import_worker: Optional[_ImportWorker] = None
+
+        # Open (non-modal) transform dialogs, keyed by target entry id
+        self._transform_sessions: dict = {}
+
+        # Open (non-modal) Add Detector dialog, if any.  Registered so a second
+        # toolbar click replaces it instead of stacking a second ghost preview
+        # (the ghost is one set of actors in the main scene).
+        self._detector_dialog: Optional[DetectorDialog] = None
 
         # Build UI (create all widgets first, then apply theme)
         self._init_toolbar()
@@ -325,6 +420,8 @@ class MainWindow(QMainWindow):
         self._toolbar.clear_clicked.connect(self._on_clear_all)
         self._toolbar.redefine_world_clicked.connect(self._on_redefine_world)
         self._toolbar.material_clicked.connect(self._on_material_assignment)
+        self._toolbar.add_box_clicked.connect(self._on_add_box_detector)
+        self._toolbar.add_sphere_clicked.connect(self._on_add_sphere_detector)
         self._toolbar.theme_toggled.connect(self._toggle_theme)
         self._toolbar.help_clicked.connect(self._on_help)
 
@@ -345,6 +442,8 @@ class MainWindow(QMainWindow):
             self._on_delete_geometry)
         self._project_tree.transform_requested.connect(
             self._on_transform_requested)
+        self._project_tree.edit_material_requested.connect(
+            self._on_edit_material)
 
         # Set up placement override provider so scene can resolve overrides
         # during placement accumulation.
@@ -651,6 +750,92 @@ class MainWindow(QMainWindow):
                 f"World: {full:.1f} × {full:.1f} × {full:.1f} mm"
                 + (f"  ({len(world_nodes)} files)" if len(world_nodes) > 1 else ""))
 
+    # ==================== Add detector (box / sphere) ====================
+
+    def _on_add_box_detector(self):
+        self._on_add_detector(BOX)
+
+    def _on_add_sphere_detector(self):
+        self._on_add_detector(SPHERE)
+
+    def _on_add_detector(self, shape: str):
+        """Add a box / sphere detector as its own GDML file, next to the imports."""
+        # The ghost preview is a single set of actors in the main scene, so only
+        # one Add Detector dialog can be open at a time: reject any pending one
+        # (which drops its ghost) before opening the requested shape.
+        if self._detector_dialog is not None:
+            self._detector_dialog.reject()
+
+        root = self._gdml_agent.get_root_node()
+        existing = collect_existing_names(root)
+
+        # Inherit the project's world size when there is one: the detector then
+        # shares the world box the main view already draws (identical world
+        # sizes keep VtkScene's unified-world mode, instead of adding a second
+        # differently sized wireframe box).
+        world_size = None
+        for wnode in self._gdml_agent.get_world_nodes():
+            params = wnode.solid_params or {}
+            if all(k in params for k in ("x", "y", "z")):
+                world_size = (params["x"], params["y"], params["z"])
+                break
+
+        dialog = DetectorDialog(
+            shape=shape,
+            default_name=make_unique_name(existing, shape),
+            existing_names=existing,
+            world_size=world_size,
+            parent=self,
+        )
+        self._detector_dialog = dialog
+        dialog.preview_changed.connect(self._on_detector_preview)
+        dialog.finished.connect(self._on_detector_finished)
+        dialog.show()
+        # The form was filled before the signal was connected, so seed the ghost
+        # explicitly - otherwise the main view stays empty until the first edit.
+        self._on_detector_preview(dialog.preview())
+
+    def _on_detector_preview(self, spec: dict):
+        """Mirror the Add Detector dialog's current sizes into the main 3D view."""
+        if self._vtk_widget is None:
+            return
+        self._vtk_widget.get_scene().show_detector_preview(
+            spec["shape"], spec["params_mm"], spec["world_size"])
+
+    def _on_detector_finished(self, result: int):
+        """Dialog closed: always drop the ghost; on Add, commit the real file."""
+        dialog = self._detector_dialog
+        if dialog is None:
+            return
+        self._detector_dialog = None
+
+        # The ghost is only a preview either way - on Add the actual geometry is
+        # drawn by the rebuild below.  (A rebuild that happened while the dialog
+        # was open has already dropped it, so this is a no-op then.)
+        if self._vtk_widget is not None:
+            self._vtk_widget.get_scene().clear_detector_preview()
+
+        if result == QDialog.DialogCode.Accepted:
+            file_node = build_detector_file_node(
+                shape=dialog.shape,
+                name=dialog.detector_name,
+                params_mm=dialog.params_mm,
+                world_size=dialog.world_size,
+            )
+
+            self._gdml_agent.add_parsed_file_node(file_node)
+            self._rebuild_ui()
+            # Put the new file in focus so it is obvious what was just created.
+            self._project_tree.select_item_by_entry_id(file_node.entry_id)
+
+            size_text = format_size_text(dialog.shape, dialog.params_mm)
+            self._logger.log_system(
+                f"Added {SHAPES[dialog.shape]['label'].lower()} detector: "
+                f"{file_node.name} ({size_text})")
+            self._status_label.setText(f"Added {file_node.name} — {size_text}")
+
+        dialog.deleteLater()
+
     def _on_help(self):
         """Show help information"""
         QMessageBox.about(self, "About GDML Editor",
@@ -664,6 +849,19 @@ class MainWindow(QMainWindow):
 
     def _on_material_assignment(self):
         """Open the batch material assignment dialog."""
+        self._open_material_dialog()
+
+    def _on_edit_material(self, entry_id: str):
+        """Right-click a volume -> open the material dialog focused on it."""
+        self._open_material_dialog(focus_entry_id=entry_id)
+
+    def _open_material_dialog(self, focus_entry_id: Optional[str] = None):
+        """Open the batch material assignment dialog.
+
+        Args:
+            focus_entry_id: when given, the dialog scrolls to and selects the
+                row of this volume, so the user lands on what they clicked.
+        """
         file_nodes = self._gdml_agent.get_all_file_nodes()
         if not file_nodes:
             QMessageBox.information(
@@ -671,7 +869,8 @@ class MainWindow(QMainWindow):
                 "No GDML files loaded.\nImport a GDML file first.")
             return
 
-        dialog = AssignMaterialDialog(self._gdml_agent, self._mat_lib, self)
+        dialog = AssignMaterialDialog(self._gdml_agent, self._mat_lib, self,
+                                      focus_entry_id=focus_entry_id)
         dialog.materials_saved.connect(self._on_materials_saved)
         dialog.exec()
 
@@ -898,65 +1097,81 @@ class MainWindow(QMainWindow):
                 + node.node_type.name)
             return
 
+        # Non-modal: the user can pan / zoom / rotate the 3D view, or browse the
+        # tree, while tuning the spinboxes. One editor per target - re-selecting
+        # the same node raises the open dialog instead of stacking a second one
+        # with its own revert snapshot.
+        existing = self._transform_sessions.get(target_entry_id)
+        if existing is not None:
+            existing.dialog.show()
+            existing.dialog.raise_()
+            existing.dialog.activateWindow()
+            return
+
         dialog = TransformDialog(title, target_label, placement, self)
 
         # ── Live preview ──
-        # The dialog is modal, but the 3D view stays visible behind it, so the
-        # edit can be shown while the user types / scrolls. Only the affected
-        # subtree is refreshed (VtkWidget.refresh_placement): geometry, mapper,
-        # selection highlight and the camera are all preserved, i.e. no full
-        # scene rebuild. Whatever the preview pushed into the model is reverted
-        # when the dialog is not accepted, so the model is never left
-        # half-edited (Cancel / Esc / closing the window all land here).
-        prev_file_transform = (refresh_root.file_transform
-                               if is_file_transform else None)
-        prev_override = self._gdml_agent.get_placement_override(target_entry_id)
-
-        def apply_placement(p: Placement) -> int:
-            """Push `p` into the model and refresh only the affected actors."""
-            if is_file_transform:
-                # File-level transform is stored on the node itself
-                refresh_root.file_transform = Placement(
-                    x=p.x, y=p.y, z=p.z,
-                    rot_x=p.rot_x, rot_y=p.rot_y, rot_z=p.rot_z)
-            else:
-                # Placement override (lives in agent's _placement_overrides)
-                self._gdml_agent.set_placement_override(target_entry_id, p)
-            if self._vtk_widget is None:
-                return 0
-            return self._vtk_widget.refresh_placement(refresh_root)
-
+        # Only the affected subtree is refreshed (VtkWidget.refresh_placement):
+        # geometry, mapper, selection highlight and the camera are all
+        # preserved, i.e. no full scene rebuild. Whatever the preview pushed
+        # into the model is reverted when the dialog is not accepted, so the
+        # model is never left half-edited (Cancel / Esc / closing the window all
+        # land in _on_transform_finished).
+        session = _TransformSession(
+            owner=self,
+            dialog=dialog,
+            target_entry_id=target_entry_id,
+            refresh_root=refresh_root,
+            is_file_transform=is_file_transform,
+            prev_file_transform=(refresh_root.file_transform
+                                 if is_file_transform else None),
+            prev_override=self._gdml_agent.get_placement_override(
+                target_entry_id),
+        )
         # Debounce: one spinbox step with the wheel or holding a key must not
         # trigger one repaint each - only the last value of the burst matters.
-        preview_timer = QTimer(self)
-        preview_timer.setSingleShot(True)
-        preview_timer.setInterval(60)
-        preview_timer.timeout.connect(
-            lambda: apply_placement(dialog.current_placement()))
-        dialog.placement_changed.connect(lambda _p: preview_timer.start())
+        session.start_preview()
 
-        accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        preview_timer.stop()
-        preview_timer.deleteLater()
+        self._transform_sessions[target_entry_id] = session
+        dialog.finished.connect(
+            lambda result: self._on_transform_finished(session, result))
+        dialog.show()
+        dialog.raise_()
 
-        if accepted:
+    def _on_transform_finished(self, session: _TransformSession, result: int):
+        """Commit or revert a non-modal transform dialog once it closes."""
+        self._transform_sessions.pop(session.target_entry_id, None)
+        session.stop_preview()
+
+        if session.superseded:
+            # The tree was rebuilt underneath the dialog: its target node is
+            # gone, so there is nothing left to commit or roll back.
+            session.dialog.deleteLater()
+            return
+
+        if result == QDialog.DialogCode.Accepted:
             # Commit the spinbox values as they are now. This is also the only
             # apply for "opened the dialog and pressed OK without editing",
             # where placement_changed never fired.
-            updated = apply_placement(dialog.get_placement())
+            updated = session.apply_placement(session.dialog.get_placement())
             self._logger.log_system(
                 f"Transform applied: {updated} actor(s) updated")
         else:
-            # Cancel: undo the live preview to the pre-dialog state
-            if is_file_transform:
-                refresh_root.file_transform = prev_file_transform
-            elif prev_override is not None:
-                self._gdml_agent.set_placement_override(
-                    target_entry_id, prev_override)
-            else:
-                self._gdml_agent.clear_placement_override(target_entry_id)
-            if self._vtk_widget:
-                self._vtk_widget.refresh_placement(refresh_root)
+            # Cancel / Esc / window close: undo the live preview
+            session.revert()
+
+        session.dialog.deleteLater()
+
+    def _close_transform_sessions(self):
+        """Tear down every open transform dialog after the tree was rebuilt.
+
+        Their target nodes no longer exist, so any pending preview must be
+        dropped instead of written back (see _TransformSession.superseded).
+        """
+        for session in list(self._transform_sessions.values()):
+            session.superseded = True
+            session.dialog.close()      # -> finished -> _on_transform_finished
+        self._transform_sessions.clear()
 
     def _on_node_picked(self, entry_id: str):
         """Node picked in 3D view"""
@@ -973,6 +1188,11 @@ class MainWindow(QMainWindow):
         dialog text and pump the event loop, keeping the UI responsive while
         large geometry is being rebuilt.
         """
+        # Non-modal transform dialogs survive an import/delete, but their
+        # target nodes do not: close them before the tree is replaced, so no
+        # preview is written back onto a stale node.
+        self._close_transform_sessions()
+
         root = self._gdml_agent.get_root_node()
         scene = self._vtk_widget.get_scene()
 

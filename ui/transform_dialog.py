@@ -7,14 +7,19 @@ Supports two modes:
    (translates/rotates all geometry in the file as a single group)
 
 Usage:
-    dialog = TransformDialog(title, target_label, initial_placement, parent)
-    if dialog.exec() == QDialog.DialogCode.Accepted:
-        new_placement = dialog.get_placement()
+    The dialog is deliberately non-modal, so the rest of the application
+    (pan / zoom / rotate the 3D view, browse the tree) stays usable while
+    transform values are being tuned. The caller therefore cannot block on
+    exec(); it drives the dialog from the finished() signal instead:
+
+        dialog = TransformDialog(title, target_label, initial_placement, parent)
+        dialog.finished.connect(on_closed)   # commit / revert here
+        dialog.show()                        # keep a reference to `dialog`!
 
     # Live preview: connect placement_changed() and the caller may show the
     # edit in the 3D view while the dialog is still open. The caller is then
-    # responsible for reverting its own state if exec() does not return
-    # Accepted (Cancel / Esc / window close).
+    # responsible for reverting its own state when the dialog is not accepted
+    # (Cancel / Esc / window close all report Rejected through finished()).
 """
 
 from typing import Optional
@@ -30,6 +35,9 @@ from core.gdml_tree import Placement
 
 class TransformDialog(QDialog):
     """Dialog for editing position and rotation values.
+
+    Non-modal: the user can keep working in the main window (zoom / rotate the
+    3D view, change the tree selection) while adjusting the spinboxes.
 
     Emits `placement_changed(Placement)` on every edit (typing, arrow keys,
     mouse wheel) so the caller can preview it live. The signal is advisory
@@ -58,7 +66,10 @@ class TransformDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(360)
-        self.setModal(True)
+        # Non-modal on purpose: values are tuned while the 3D view behind it is
+        # still being panned / zoomed. The caller owns commit/revert via the
+        # finished() signal, and must keep a reference to this dialog.
+        self.setModal(False)
 
         self._placement = Placement(
             x=placement.x, y=placement.y, z=placement.z,

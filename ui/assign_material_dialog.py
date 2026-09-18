@@ -59,7 +59,7 @@ class AssignMaterialDialog(QDialog):
     materials_saved = pyqtSignal(int, int)  # assigned, total
 
     def __init__(self, gdml_agent: GdmlAgent, material_lib: MaterialsLib,
-                 parent=None):
+                 parent=None, focus_entry_id: Optional[str] = None):
         super().__init__(parent)
         self._gdml_agent = gdml_agent
         self._mat_lib = material_lib
@@ -75,6 +75,12 @@ class AssignMaterialDialog(QDialog):
         self._build_ui()
         self._populate_table()
         self._apply_theme()
+
+        # Right-click entry point: jump straight to the clicked volume's row.
+        # Deferred: scrollToItem needs a laid-out viewport, which only exists
+        # once exec() has shown the dialog and the event loop has started.
+        if focus_entry_id:
+            QTimer.singleShot(0, lambda: self._focus_entry(focus_entry_id))
 
     # ---- UI Construction ----
 
@@ -179,14 +185,25 @@ class AssignMaterialDialog(QDialog):
                 row, COL_ENTRY_ID, QTableWidgetItem(node.entry_id))
 
     def _append_node_rows(self, node: GdmlNode, depth: int):
-        """Recursively flatten tree into _all_rows, skipping structural intermediate nodes (SOLID_DEF etc.)."""
-        # Skip purely structural node types (SOLID_DEF, DEFINE/MATERIAL/AUX, PHYVOL)
+        """Recursively flatten the tree into _all_rows, one row per logical <volume>.
+
+        Physical placements (PHYVOL_NODE) are skipped *without* expanding their
+        children: each physvol holds a cloned copy of the logical volume it
+        references (see gdml_parser._clone_volume_instance), so descending would
+        list the same <volume> once per placement. Only the definitions under the
+        file node (LogicalVolumeStore) and the world are shown.
+        """
+        # Physical instances: the referenced logical volume is already listed as
+        # a definition, so never descend into the clone.
+        if node.node_type == GdmlNodeType.PHYVOL_NODE:
+            return
+
+        # Skip purely structural node types (SOLID_DEF, DEFINE/MATERIAL/AUX)
         skip_types = {
             GdmlNodeType.SOLID_DEF,
             GdmlNodeType.DEFINE_NODE,
             GdmlNodeType.MATERIAL_NODE,
             GdmlNodeType.AUX_NODE,
-            GdmlNodeType.PHYVOL_NODE,
         }
         if node.node_type in skip_types:
             for child in node.children:
@@ -216,6 +233,55 @@ class AssignMaterialDialog(QDialog):
         mat_item.setToolTip(mat)
         self._table.setItem(row, COL_MATERIAL, mat_item)
 
+    # ---- Focus (right-click "Edit Material" entry point) ----
+
+    def _focus_entry(self, entry_id: Optional[str]) -> None:
+        """Scroll to and select the row of the volume the user right-clicked.
+
+        No-op when the dialog was opened from the toolbar (entry_id is None)
+        or when the id is not in the table (e.g. a stale entry).
+        """
+        if not entry_id:
+            return
+
+        target_row = self._find_row_by_entry_id(entry_id)
+        if target_row < 0:
+            # Right-click may target a physical instance (clone), whose entry_id
+            # is not listed anymore; fall back to the logical volume name, which
+            # the clone shares with its definition.
+            clicked = self._gdml_agent.get_node_by_entry_id(entry_id)
+            if clicked is not None:
+                target_row = self._find_row_by_name(clicked.name)
+        if target_row < 0:
+            return
+
+        # setCurrentCell moves the focus frame, selectRow paints the highlight —
+        # both are needed because the table uses ExtendedSelection.
+        self._table.setCurrentCell(target_row, COL_NODE_NAME)
+        self._table.selectRow(target_row)
+        item = self._table.item(target_row, COL_NODE_NAME)
+        if item is not None:
+            self._table.scrollToItem(
+                item, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _find_row_by_entry_id(self, entry_id: str) -> int:
+        """Row index of the listed node with this entry_id, or -1."""
+        for row, (node, _depth, _assignable) in enumerate(self._all_rows):
+            if node.entry_id == entry_id:
+                return row
+        return -1
+
+    def _find_row_by_name(self, name: str) -> int:
+        """First assignable row whose node name matches, or -1.
+
+        Fallback used because a physical instance (clone) and its logical volume
+        share the same name but have different entry_ids.
+        """
+        for row, (node, _depth, assignable) in enumerate(self._all_rows):
+            if assignable and node.name == name:
+                return row
+        return -1
+
     # ---- Right-click Context Menu (embedded QComboBox, same as cad2gdml) ----
 
     def _on_table_context_menu(self, pos):
@@ -239,9 +305,11 @@ class AssignMaterialDialog(QDialog):
         global_names = self._mat_lib.get_nist_left_list()
         global_combo = QComboBox()
         global_combo.setPlaceholderText("Select global material...")
-        global_combo.addItem("")  # empty = clear
         for name in global_names:
             global_combo.addItem(name)
+        # No blank first entry: clearing is handled by "Clear Material" below,
+        # and index -1 makes the placeholder show instead of an empty row.
+        global_combo.setCurrentIndex(-1)
         global_combo.currentTextChanged.connect(
             lambda txt, m=menu: (
                 self._on_global_selected(txt, assignable_rows,
@@ -257,9 +325,11 @@ class AssignMaterialDialog(QDialog):
         local_names = self._mat_lib.get_local_material_names()
         local_combo = QComboBox()
         local_combo.setPlaceholderText("Select local material...")
-        local_combo.addItem("")  # empty = clear
         for name in sorted(local_names):
             local_combo.addItem(name)
+        # No blank first entry: clearing is handled by "Clear Material" below,
+        # and index -1 makes the placeholder show instead of an empty row.
+        local_combo.setCurrentIndex(-1)
         local_combo.currentTextChanged.connect(
             lambda txt, m=menu: (
                 self._on_local_selected(txt, assignable_rows,
@@ -283,7 +353,7 @@ class AssignMaterialDialog(QDialog):
             return
         self._apply_material_to_rows(text, rows)
         global_cb.blockSignals(True)
-        global_cb.setCurrentIndex(0)
+        global_cb.setCurrentIndex(-1)
         global_cb.blockSignals(False)
 
     def _on_local_selected(self, text: str, rows: set,
@@ -292,7 +362,7 @@ class AssignMaterialDialog(QDialog):
             return
         self._apply_material_to_rows(text, rows)
         local_cb.blockSignals(True)
-        local_cb.setCurrentIndex(0)
+        local_cb.setCurrentIndex(-1)
         local_cb.blockSignals(False)
 
     def _apply_material_to_rows(self, material_name: str, rows: set):

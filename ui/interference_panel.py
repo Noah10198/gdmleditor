@@ -9,6 +9,7 @@ Each row is a volume with:
   ☐ name       [status]   [View]
 """
 
+import os
 import random
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +32,18 @@ from core.gdml_tree import GdmlNode, GdmlNodeType
 
 
 # ── Helpers ──────────────────────────────────────────────────────
+
+# Generated files land in gdmleditor/output/ rather than the system temp dir.
+# SVN cannot version an empty directory, so the folder is created on demand.
+OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+
+
+def _output_path(filename: str) -> str:
+    """Absolute path inside gdmleditor/output/, creating the folder on first use."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, filename)
+
 
 def _collect_instance_volumes(agent) -> List[Tuple[GdmlNode, str, str]]:
     """Get volumes that are actually rendered in the 3D scene.
@@ -105,11 +118,34 @@ class _CollisionWorker(QThread):
     def stop(self):
         self._stop = True
 
+    def _restore_vtk_messages(self):
+        """Put the global VTK message sinks back the way the app expects them."""
+        from vtkmodules.vtkCommonCore import vtkLogger, vtkOutputWindow
+        prev = getattr(self, "_prev_output_window", None)
+        if prev is not None:
+            vtkOutputWindow.SetInstance(prev)
+        vtkLogger.SetStderrVerbosity(vtkLogger.VERBOSITY_WARNING)
+        self._vtk_sink = None
+
     def run(self):
         total = len(self._pairs)
 
-        # Suppress VTK warnings during intersection
-        from vtkmodules.vtkCommonCore import vtkLogger
+        # VTK has two independent message sinks: the logger's stderr channel and
+        # vtkOutputWindow (the popup).  Silencing the logger alone still leaves
+        # the popup, which is what the user sees.  On tessellated GS20 meshes
+        # vtkIntersectionPolyDataFilter is chatty: it warns about the degenerate
+        # / non-manifold edges it meets while still returning a usable result.
+        # Send both sinks to a file for the duration of the check.  It lands in
+        # gdmleditor/output/ so it is findable when a check does misbehave; a
+        # fresh vtkFileOutputWindow reopens the path, so each run truncates the
+        # log instead of growing it forever.
+        from vtkmodules.vtkCommonCore import (
+            vtkLogger, vtkOutputWindow, vtkFileOutputWindow,
+        )
+        self._prev_output_window = vtkOutputWindow.GetInstance()
+        self._vtk_sink = vtkFileOutputWindow()
+        self._vtk_sink.SetFileName(_output_path("easy2rad_vtk.log"))
+        vtkOutputWindow.SetInstance(self._vtk_sink)
         vtkLogger.SetStderrVerbosity(vtkLogger.VERBOSITY_OFF)
 
         from vtkmodules.vtkFiltersGeneral import vtkIntersectionPolyDataFilter
@@ -143,6 +179,7 @@ class _CollisionWorker(QThread):
 
         for idx_a, idx_b in self._pairs:
             if self._stop:
+                self._restore_vtk_messages()
                 return
 
             cpd_a = clean_pds[idx_a]
@@ -165,6 +202,21 @@ class _CollisionWorker(QThread):
                     intersect = vtkIntersectionPolyDataFilter()
                     intersect.SetInputData(0, cpd_a)
                     intersect.SetInputData(1, cpd_b)
+                    # We only need output port 0 (the intersection lines) to
+                    # decide whether the surfaces cross.  By default the filter
+                    # also builds two "split" meshes, and that path walks the
+                    # intersection-line graph in Impl::GetSingleLoop():
+                    #     while (nextPt != startPt) { ... }
+                    # which never returns when the graph contains a closed loop
+                    # that omits startPt.  On tessellated GS20 meshes this
+                    # happens non-deterministically — identical input bytes flip
+                    # between ~5 ms and an infinite loop — which is why Full mode
+                    # appeared to hang once a second geometry was imported.
+                    # The split outputs are unused here, so switch them off: the
+                    # decision is identical and each pair runs ~7x faster.
+                    intersect.SetSplitFirstOutput(False)
+                    intersect.SetSplitSecondOutput(False)
+                    intersect.SetCheckMesh(False)
                     intersect.Update()
                     result_mesh = intersect.GetOutput()
                     n_cells = result_mesh.GetNumberOfCells()
@@ -185,8 +237,7 @@ class _CollisionWorker(QThread):
             done += 1
             self.progress.emit(done, total)
 
-        # Restore VTK warnings
-        vtkLogger.SetStderrVerbosity(vtkLogger.VERBOSITY_WARNING)
+        self._restore_vtk_messages()
 
         # Emit ✅ for volumes with no collisions at all
         all_indices = set(range(len(self._volumes)))

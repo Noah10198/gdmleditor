@@ -11,7 +11,7 @@ Responsibilities:
 Based on cad2gdml's occ_widget.py design style.
 """
 
-from typing import Dict, Optional, List, Tuple, Callable
+from typing import Dict, Optional, List, Tuple, Callable, Sequence
 import math
 
 from vtkmodules.vtkRenderingCore import (
@@ -30,10 +30,11 @@ from vtkmodules.vtkCommonCore import vtkCommand
 from vtkmodules.vtkCommonDataModel import vtkPolyData
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
-from vtkmodules.vtkFiltersSources import vtkCubeSource
+from vtkmodules.vtkFiltersSources import vtkCubeSource, vtkSphereSource
 
+from core.detector_factory import SPHERE
 from core.gdml_tree import GdmlNode, GdmlNodeType, Placement
-from vtk_engine import WORLD_BOX_COLOR
+from vtk_engine import DETECTOR_COLOR, WORLD_BOX_COLOR
 from vtk_engine.vtk_solid_factory import VtkSolidFactory
 
 
@@ -59,6 +60,12 @@ class VtkScene:
         # "Redefine World" preview can re-size just the world box instead of
         # rebuilding the whole tree (a full rebuild is expensive on big scenes).
         self._world_box_actors: List[vtkActor] = []
+
+        # Ghost detector shown while the Add Detector dialog is open (dict of
+        # shape + sources + actors, see show_detector_preview).  Deliberately
+        # kept out of _actor_map: it corresponds to no tree node, so picking
+        # skips it and no rebuild bookkeeping has to know about it.
+        self._detector_preview: Optional[dict] = None
 
         # Selected entry_id
         self._selected_id: Optional[str] = None
@@ -183,6 +190,11 @@ class VtkScene:
         """Clear scene"""
         self._actor_map.clear()
         self._world_box_actors.clear()
+        # RemoveAllViewProps() below also drops the Add Detector ghost, so
+        # forget it here: clearing the reference keeps a rebuild from having to
+        # know about it, and stops a later clear_detector_preview() from
+        # removing an actor that is no longer ours.
+        self._detector_preview = None
         self._renderer.RemoveAllViewProps()
         self._selected_id = None
         self._selected_actor = None
@@ -239,6 +251,12 @@ class VtkScene:
         intersect = vtkIntersectionPolyDataFilter()
         intersect.SetInputData(0, poly_a)
         intersect.SetInputData(1, poly_b)
+        # Only the intersection lines (output port 0) are needed.  The default
+        # split outputs walk the line graph in Impl::GetSingleLoop(), whose
+        # `while (nextPt != startPt)` can spin forever — see interference_panel.
+        intersect.SetSplitFirstOutput(False)
+        intersect.SetSplitSecondOutput(False)
+        intersect.SetCheckMesh(False)
         intersect.Update()
         result = intersect.GetOutput()
         if result.GetNumberOfPoints() == 0:
@@ -688,6 +706,105 @@ class VtkScene:
         actor.SetUserTransform(transform)
         self._renderer.AddActor(actor)
         self._world_box_actors.append(actor)
+
+    # ==================== Add Detector ghost ====================
+
+    def show_detector_preview(self, shape: str, params_mm: Dict[str, float],
+                              world_size: Sequence[float]) -> None:
+        """Draw the detector the Add Detector dialog is currently defining.
+
+        The dialog has no viewport of its own: the ghost is drawn into the main
+        scene instead, so it is seen in place - same camera, same project
+        geometry, against the world box the new file will actually get - and
+        can be panned / zoomed while the sizes are tuned.
+
+        Only the two sources are re-parameterised, so a size edit never rebuilds
+        the project geometry and never moves the camera.
+
+        Args:
+            shape: BOX or SPHERE.
+            params_mm: The shape's dimensions in millimetres.
+            world_size: (x, y, z) mm of the world box the detector is placed in.
+        """
+        preview = self._detector_preview
+        if preview is None or preview["shape"] != shape:
+            self.clear_detector_preview()
+            preview = self._build_detector_preview(shape)
+            self._detector_preview = preview
+
+        det = preview["detector"]
+        if shape == SPHERE:
+            det.SetRadius(max(float(params_mm.get("rmax", 1.0)), 1e-6))
+        else:
+            det.SetXLength(max(float(params_mm.get("x", 1.0)), 1e-6))
+            det.SetYLength(max(float(params_mm.get("y", 1.0)), 1e-6))
+            det.SetZLength(max(float(params_mm.get("z", 1.0)), 1e-6))
+        det.Update()
+
+        world = preview["world"]
+        if world is not None:
+            world.SetXLength(float(world_size[0]))
+            world.SetYLength(float(world_size[1]))
+            world.SetZLength(float(world_size[2]))
+            world.Update()
+
+        self.render()
+
+    def clear_detector_preview(self) -> None:
+        """Drop the Add Detector ghost (dialog cancelled / accepted / closed)."""
+        preview = self._detector_preview
+        if preview is None:
+            return
+        self._renderer.RemoveActor(preview["detector_actor"])
+        world_actor = preview.get("world_actor")
+        if world_actor is not None:
+            self._renderer.RemoveActor(world_actor)
+        self._detector_preview = None
+        self.render()
+
+    def _build_detector_preview(self, shape: str) -> dict:
+        """Create the ghost detector (plus a world frame when needed)."""
+        preview: dict = {"shape": shape}
+
+        # The scene already draws the project's world box, and the detector file
+        # inherits that exact size - so a frame of our own is only needed when
+        # there is none to reuse (project without a world volume yet).  Drawing
+        # a second, identical wireframe on top of it would only z-fight.
+        world_src = None
+        if not self._world_box_actors:
+            world_src = vtkCubeSource()
+            world_src.Update()
+            world_mapper = vtkPolyDataMapper()
+            world_mapper.SetInputConnection(world_src.GetOutputPort())
+            world_actor = vtkActor()
+            world_actor.SetMapper(world_mapper)
+            world_actor.GetProperty().SetRepresentationToWireframe()
+            world_actor.GetProperty().SetColor(*WORLD_BOX_COLOR)
+            world_actor.GetProperty().SetLineWidth(2)
+            self._renderer.AddActor(world_actor)
+            preview["world_actor"] = world_actor
+        preview["world"] = world_src
+
+        if shape == SPHERE:
+            det_src = vtkSphereSource()
+            det_src.SetThetaResolution(48)
+            det_src.SetPhiResolution(48)
+        else:
+            det_src = vtkCubeSource()
+        det_src.Update()
+        det_mapper = vtkPolyDataMapper()
+        det_mapper.SetInputConnection(det_src.GetOutputPort())
+        det_actor = vtkActor()
+        det_actor.SetMapper(det_mapper)
+        prop = det_actor.GetProperty()
+        prop.SetColor(*DETECTOR_COLOR)
+        prop.SetEdgeVisibility(True)
+        prop.SetEdgeColor(0.05, 0.05, 0.05)
+        prop.SetLineWidth(1)
+        self._renderer.AddActor(det_actor)
+        preview["detector"] = det_src
+        preview["detector_actor"] = det_actor
+        return preview
 
     def get_actor_for_node(self, entry_id: str) -> Optional[vtkActor]:
         """Get actor for a given node"""

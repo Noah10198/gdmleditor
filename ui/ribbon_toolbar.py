@@ -2,7 +2,8 @@
 RibbonToolBar - Office-style Ribbon Toolbar
 
 Based on cad2gdml's toolbar.py design, provides emoji-icon Ribbon toolbar.
-Buttons: Import GDML, Reset View, Export, Clear All, Redefine World, Dark/Light toggle, Help
+Buttons: Import GDML, Interference, Material | Box, Sphere | Redefine World,
+Export GDML | Reset View, Clear All, Dark/Light toggle, Help
 """
 
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QToolButton, QSizePolicy, QFrame
@@ -49,6 +50,8 @@ class RibbonToolBar(QWidget):
     clear_clicked = pyqtSignal()
     material_clicked = pyqtSignal()
     interference_clicked = pyqtSignal()
+    add_box_clicked = pyqtSignal()
+    add_sphere_clicked = pyqtSignal()
     theme_toggled = pyqtSignal()
     help_clicked = pyqtSignal()
 
@@ -65,36 +68,39 @@ class RibbonToolBar(QWidget):
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(4)
 
-        # Define buttons: (emoji, label, signal)
-        buttons = [
-            ("📂", "Import GDML", self.import_clicked),
-            ("🔌", "Interference", self.interference_clicked),
-            ("🧪", "Material", self.material_clicked),
-            ("📐", "Redefine World", self.redefine_world_clicked),
-            ("💾", "Export GDML", self.export_clicked),
+        # Button groups, separated by vertical rules:
+        #   import / inspect | add detector | world + output | view reset
+        groups = [
+            [
+                ("📂", "Import GDML", self.import_clicked),
+                ("🔌", "Interference", self.interference_clicked),
+                ("🧪", "Material", self.material_clicked),
+            ],
+            [
+                ("🧊", "Box", self.add_box_clicked),
+                ("🌐", "Sphere", self.add_sphere_clicked),
+            ],
+            [
+                ("📐", "Redefine World", self.redefine_world_clicked),
+                ("💾", "Export GDML", self.export_clicked),
+            ],
+            [
+                ("🎯", "Reset View", self.reset_view_clicked),
+                ("🗑️", "Clear All", self.clear_clicked),
+            ],
         ]
 
-        for emoji, label, signal in buttons:
-            btn = _ribbon_button(emoji, label)
-            btn.clicked.connect(signal.emit)
-            layout.addWidget(btn)
-
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        sep.setFixedWidth(3)
-        layout.addWidget(sep)
-
-        # Right-side buttons after separator
-        right_buttons = [
-            ("🎯", "Reset View", self.reset_view_clicked),
-            ("🗑️", "Clear All", self.clear_clicked),
-        ]
-        for emoji, label, signal in right_buttons:
-            btn = _ribbon_button(emoji, label)
-            btn.clicked.connect(signal.emit)
-            layout.addWidget(btn)
+        for index, group in enumerate(groups):
+            if index:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.VLine)
+                sep.setFrameShadow(QFrame.Shadow.Sunken)
+                sep.setFixedWidth(3)
+                layout.addWidget(sep)
+            for emoji, label, signal in group:
+                btn = _ribbon_button(emoji, label)
+                btn.clicked.connect(signal.emit)
+                layout.addWidget(btn)
 
         # Right side button group (separated by stretch)
         layout.addStretch()

@@ -35,6 +35,7 @@ class ProjectTreeWidget(QWidget):
     solid_preview_requested = pyqtSignal(str)   # Right-click solid -> preview in 3D
     delete_geometry_requested = pyqtSignal(str) # Delete GDML file by entry_id
     transform_requested = pyqtSignal(str)       # Right-click volume/file -> edit transform
+    edit_material_requested = pyqtSignal(str)   # Right-click volume -> edit its material
 
     # Material signals (matches cad2gdml)
     assign_material_requested = pyqtSignal()
@@ -242,15 +243,22 @@ class ProjectTreeWidget(QWidget):
                     self.delete_geometry_requested.emit(entry_id)
             return
 
-        # Volume instance under World: edit physvol placement
+        # Volume instance under World: edit physvol placement / material
         if node_type_val == GdmlNodeType.VOLUME_NODE.value:
             menu = QMenu(self)
             edit_act = menu.addAction("Edit Transform...")
+            menu.addSeparator()
+            mat_act = menu.addAction("Edit Material...")
             action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            if action is None:
+                return
+            entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
+            if not entry_id:
+                return
             if action == edit_act:
-                entry_id = item.data(0, TREE_ITEM_DATA_ROLE)
-                if entry_id:
-                    self.transform_requested.emit(entry_id)
+                self.transform_requested.emit(entry_id)
+            elif action == mat_act:
+                self.edit_material_requested.emit(entry_id)
             return
 
     # ==================== Geometry Tree ====================
