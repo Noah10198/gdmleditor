@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- 三角网格：填满画布，6 个调色盘颜色 -->
+  <g stroke="#000" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round">
+    <polygon points="128,1.75 64.875,128 128,128" fill="#FF7F7F"/>
+    <polygon points="128,1.75 128,128 191.125,128" fill="#FFA500"/>
+    <polygon points="64.875,128 1.75,254.25 128,128" fill="#FFD54F"/>
+    <polygon points="191.125,128 128,128 254.25,254.25" fill="#81C784"/>
+    <polygon points="1.75,254.25 128,254.25 128,128" fill="#64B5F6"/>
+    <polygon points="128,128 128,254.25 254.25,254.25" fill="#9575CD"/>
+
+    <line x1="64.875" y1="128" x2="191.125" y2="128"/>
+    <line x1="128" y1="1.75" x2="128" y2="128"/>
+    <line x1="1.75" y1="254.25" x2="128" y2="128"/>
+    <line x1="254.25" y1="254.25" x2="128" y2="128"/>
+    <line x1="128" y1="128" x2="128" y2="254.25"/>
+
+    <polygon points="128,1.75 1.75,254.25 254.25,254.25" fill="none" stroke-width="3.5"/>
+  </g>
+
+  <!-- 铅笔：1.2 倍，右下 → 右上倾斜，笔尖对齐底边，右边缘对齐画布右边 -->
+  <g transform="translate(227, 157.5) rotate(45) scale(1.2)">
+    <rect x="0" y="-14" width="20" height="14" fill="#FF8A80" stroke="#000" stroke-width="3"/>
+    <rect x="0" y="-4" width="20" height="6" fill="#B0BEC5" stroke="#000" stroke-width="3"/>
+    <rect x="0" y="0" width="20" height="80" fill="#FFC107" stroke="#000" stroke-width="3"/>
+    <polygon points="0,80 20,80 10,104" fill="#FFE082" stroke="#000" stroke-width="3"/>
+    <polygon points="5,94 15,94 10,104" fill="#333"/>
+  </g>
+</svg>
