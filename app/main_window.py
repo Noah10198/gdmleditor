@@ -432,6 +432,8 @@ class MainWindow(QMainWindow):
             self._on_add_local_material)
         self._project_tree.remove_local_material_requested.connect(
             self._on_remove_local_material)
+        self._project_tree.edit_local_material_requested.connect(
+            self._on_edit_local_material)
         self._project_tree.save_local_materials_requested.connect(
             self._on_save_local_materials)
         self._project_tree.load_local_materials_requested.connect(
@@ -901,6 +903,31 @@ class MainWindow(QMainWindow):
             self._logger.log_system(
                 f"Local material added. Total: "
                 f"{len(self._mat_lib.get_local_material_names())}")
+
+    def _on_edit_local_material(self, mat_id: str):
+        """Re-open a saved local material for editing, in place."""
+        from core.materials_lib import CustomElement
+
+        mat = self._mat_lib.get_local_material_by_id(mat_id)
+        if mat is None or isinstance(mat, CustomElement):
+            # Custom elements have no editor of their own yet.
+            self._logger.log_system(
+                "Only compound and mixture materials can be edited.",
+                LogLevel.ERROR)
+            return
+
+        dialog = LocalMaterialDialog(self._mat_lib, self, material=mat)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._project_tree.populate_local_materials(self._mat_lib)
+        self._project_tree.select_local_material(dialog.last_mat_id)
+        # The edit writes a fresh object under the same id, so re-read it
+        # instead of showing the one the dialog was opened with.
+        updated = self._mat_lib.get_local_material_by_id(dialog.last_mat_id)
+        if updated:
+            self._property_panel.show_local_material_info(updated)
+        self._logger.log_system(f"Local material '{mat.mat_name}' updated.")
 
     def _on_remove_local_material(self, display_name: str):
         """Remove a local material by tree display name (matches cad2gdml)."""

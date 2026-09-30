@@ -41,6 +41,7 @@ class ProjectTreeWidget(QWidget):
     assign_material_requested = pyqtSignal()
     add_local_material_requested = pyqtSignal()
     remove_local_material_requested = pyqtSignal(str)   # material name
+    edit_local_material_requested = pyqtSignal(str)     # mat_id
     save_local_materials_requested = pyqtSignal()
     load_local_materials_requested = pyqtSignal()
 
@@ -101,6 +102,7 @@ class ProjectTreeWidget(QWidget):
 
         # Connect signals
         self._tree.itemClicked.connect(self._on_item_clicked)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -206,14 +208,19 @@ class ProjectTreeWidget(QWidget):
             menu.exec(self._tree.viewport().mapToGlobal(pos))
             return
 
-        # Local Material item (delete, matches cad2gdml emoji)
+        # Local Material item (edit / delete, matches cad2gdml emoji)
         if item.parent() is self._local_mat_root:
             menu = QMenu(self)
+            edit_act = menu.addAction("✏️ Edit Material...")
+            menu.addSeparator()
             del_act = menu.addAction("❌ Delete Material")
             action = menu.exec(self._tree.viewport().mapToGlobal(pos))
-            if action == del_act:
-                mat_name = item.text(0)
-                self.remove_local_material_requested.emit(mat_name)
+            if action == edit_act:
+                mat_id = self._local_mat_id(item)
+                if mat_id:
+                    self.edit_local_material_requested.emit(mat_id)
+            elif action == del_act:
+                self.remove_local_material_requested.emit(item.text(0))
             return
 
         # Solid under Solids group: preview in 3D
@@ -440,6 +447,14 @@ class ProjectTreeWidget(QWidget):
         if entry_id:
             self.node_selected.emit(entry_id)
 
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """Double-clicking a local material re-opens it for editing."""
+        if item.parent() is not self._local_mat_root:
+            return
+        mat_id = self._local_mat_id(item)
+        if mat_id:
+            self.edit_local_material_requested.emit(mat_id)
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         """Handle checkbox state cascade (matches cad2gdml's behavior)."""
         if column != 0 or item is self._geometry_root:
@@ -500,6 +515,14 @@ class ProjectTreeWidget(QWidget):
             while p:
                 p.setExpanded(True)
                 p = p.parent()
+
+    @staticmethod
+    def _local_mat_id(item: QTreeWidgetItem) -> str:
+        """mat_id of a Local Materials child, '' when it is not one."""
+        data = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if data.startswith("__local__:"):
+            return data[10:]
+        return ""
 
     def select_local_material(self, mat_id: str):
         """Select a local material item by its mat_id."""

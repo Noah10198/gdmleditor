@@ -372,6 +372,24 @@ class MaterialsLib:
                 or self.delete_compound(mat_id)
                 or self.delete_mixture(mat_id))
 
+    def update_local_material(self, mat: Any) -> bool:
+        """Overwrite an existing local material in place, keeping its mat_id.
+
+        Used when a saved material is re-opened for editing: the id is kept so
+        nothing else has to track a change, and a category switch simply moves
+        the entry to the other store.
+        """
+        if not mat.mat_id:
+            mat.mat_id = self._next_id()
+        self.delete_material(mat.mat_id)
+        if isinstance(mat, CompoundMaterial):
+            self._compounds[mat.mat_id] = mat
+        elif isinstance(mat, MixtureMaterial):
+            self._mixtures[mat.mat_id] = mat
+        else:
+            return False
+        return True
+
     def clear_all_local(self):
         self._custom_elements.clear()
         self._compounds.clear()

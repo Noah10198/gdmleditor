@@ -11,12 +11,18 @@ Matches cad2gdml style and layout:
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QDoubleSpinBox, QComboBox, QPushButton, QWidget, QGroupBox,
+    QSizePolicy,
 )
 
 from core.materials_lib import (
     MaterialsLib, CompoundMaterial, CompoundItem,
     MixtureMaterial, MixtureItem,
 )
+
+# Fixed widths of the ratio column, shared by the composition rows and their
+# header so the two line up.
+_RATIO_WIDTH = 120
+_REMOVE_BTN_WIDTH = 28
 
 
 class _CompositionRow:
@@ -29,21 +35,31 @@ class _CompositionRow:
 class LocalMaterialDialog(QDialog):
     """Dialog for adding local materials, matching cad2gdml layout/colors."""
 
-    _TOTAL_TOLERANCE = 0.01  # tolerance for mixture total == 1.0 check
+    # Mass fractions have to sum to exactly 1. An epsilon rather than a plain
+    # == 1.0 because binary floating point cannot add decimal fractions
+    # exactly (0.1 + 0.2 + 0.7 == 0.9999999999999999); 1e-6 is far above that
+    # noise and far below the 1e-4 the spin boxes can express.
+    _TOTAL_TOLERANCE = 1e-6
 
-    def __init__(self, mat_lib: MaterialsLib, parent=None):
+    def __init__(self, mat_lib: MaterialsLib, parent=None, material=None):
         super().__init__(parent)
         self._mat_lib = mat_lib
+        self._editing = material
         self._rows: list[_CompositionRow] = []
         self._last_gdml: str = ""
         self._last_mat_id: str = ""
 
-        self.setWindowTitle("Add Local Material")
+        self.setWindowTitle("Edit Local Material" if material else
+                            "Add Local Material")
         self.setMinimumSize(520, 400)
         self.resize(560, 480)
 
         self._build_ui()
         self._apply_theme()
+
+        if material is not None:
+            self._save_btn.setText("Save Changes")
+            self._load_material(material)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -77,17 +93,25 @@ class LocalMaterialDialog(QDialog):
         self._density_spin.setToolTip("Density in g/cm3")
         common_layout.addRow("Density (g/cm3):", self._density_spin)
 
+        # Keep the natural height: as a Preferred box it would take half of any
+        # extra height the dialog gets, leaving a blank patch under Density.
+        common_group.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                   QSizePolicy.Policy.Fixed)
         layout.addWidget(common_group)
 
         # -- Composition (inline rows, same as cad2gdml) --
         self._comp_group = QGroupBox("Composition")
         comp_layout = QVBoxLayout(self._comp_group)
 
-        # Header row
+        # Header row: the Ratio label carries the same fixed width as the spin
+        # box below, so the header columns sit over the actual columns.
         comp_header = QHBoxLayout()
-        comp_header.addWidget(QLabel("Element"))
-        comp_header.addWidget(QLabel("Ratio"))
-        comp_header.addStretch()
+        comp_header.setSpacing(8)
+        comp_header.addWidget(QLabel("Element"), 1)
+        ratio_header = QLabel("Ratio")
+        ratio_header.setFixedWidth(_RATIO_WIDTH)
+        comp_header.addWidget(ratio_header)
+        comp_header.addSpacing(8 + _REMOVE_BTN_WIDTH)
         comp_layout.addLayout(comp_header)
 
         # Items container
@@ -95,7 +119,12 @@ class LocalMaterialDialog(QDialog):
         self._items_layout = QVBoxLayout(self._items_widget)
         self._items_layout.setContentsMargins(0, 0, 0, 0)
         self._items_layout.setSpacing(4)
-        comp_layout.addWidget(self._items_widget)
+        # The rows are all fixed height, and a box layout with nothing
+        # stretchable hands its leftover height to the spacing between items.
+        # This trailing spacer absorbs it instead, keeping the rows packed at
+        # the top and the Add button at the bottom of the group.
+        self._items_layout.addStretch(1)
+        comp_layout.addWidget(self._items_widget, 1)
 
         # Total proportion label (for mixture validation feedback)
         total_row = QHBoxLayout()
@@ -108,23 +137,48 @@ class LocalMaterialDialog(QDialog):
         add_item_btn.clicked.connect(self._add_composition_row)
         comp_layout.addWidget(add_item_btn)
 
-        layout.addWidget(self._comp_group)
+        # Sole owner of the extra height when the dialog is resized.
+        layout.addWidget(self._comp_group, 1)
 
         # -- Buttons --
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        save_btn = QPushButton("Add Material")
-        save_btn.clicked.connect(self._on_save)
-        btn_layout.addWidget(save_btn)
+        self._save_btn = QPushButton("Add Material")
+        self._save_btn.clicked.connect(self._on_save)
+        btn_layout.addWidget(self._save_btn)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
-        # Add first row by default
-        self._add_composition_row()
+        # Add mode starts with one empty row; edit mode fills its rows from the
+        # material instead.
+        if self._editing is None:
+            self._add_composition_row()
 
     # -- Composition rows --
+
+    def _load_material(self, mat):
+        """Pre-fill every field from an existing material (edit mode).
+
+        The category is set first: the spin decimals of the rows created below
+        follow the current category.
+        """
+        is_mixture = isinstance(mat, MixtureMaterial)
+        idx = self._cat_combo.findData("mixture" if is_mixture else "compound")
+        if idx >= 0:
+            self._cat_combo.setCurrentIndex(idx)
+        self._name_edit.setText(mat.mat_name)
+        self._density_spin.setValue(mat.density)
+
+        for comp in mat.components:
+            self._add_composition_row()
+            cr = self._rows[-1]
+            pos = cr.combo.findData(comp.symbol)
+            if pos >= 0:
+                cr.combo.setCurrentIndex(pos)
+            cr.spin.setValue(comp.mass_fraction if is_mixture
+                             else comp.atom_count)
 
     def _add_composition_row(self):
         """Add one element composition row (same QHBoxLayout pattern as cad2gdml)."""
@@ -149,17 +203,20 @@ class LocalMaterialDialog(QDialog):
         spin.setToolTip(
             "Mass fraction" if is_mixture else "Atom count")
         spin.valueChanged.connect(self._update_total_display)
+        spin.setFixedWidth(_RATIO_WIDTH)
         row.addWidget(spin)
 
         remove_btn = QPushButton("x")
-        remove_btn.setFixedWidth(28)
+        remove_btn.setFixedWidth(_REMOVE_BTN_WIDTH)
         remove_btn.clicked.connect(
             lambda checked, r=row: self._remove_row(r))
         row.addWidget(remove_btn)
 
         combo.currentIndexChanged.connect(self._update_total_display)
 
-        self._items_layout.addLayout(row)
+        # Inserted before the trailing spacer so most-recently-added rows land
+        # at the bottom of the list.
+        self._items_layout.insertLayout(self._items_layout.count() - 1, row)
         self._rows.append(_CompositionRow(combo, spin))
         self._update_total_display()
 
@@ -212,7 +269,7 @@ class LocalMaterialDialog(QDialog):
                 "color: #2e7d32; font-size: 11px; font-weight: bold;")
         else:
             self._total_label.setText(
-                f"Total: {total:.4f}  (should be 1.0)")
+                f"Total: {total:.4f}  (must be 1.0)")
             self._total_label.setStyleSheet(
                 "color: #c62828; font-size: 11px; font-weight: bold;")
 
@@ -255,7 +312,7 @@ class LocalMaterialDialog(QDialog):
 
         cat = self._cat_combo.currentData()
 
-        # For mixture, validate total proportion is close to 1.0
+        # For mixture, the mass fractions have to add up to exactly 1.0
         if cat == "mixture":
             total = sum(cr.spin.value() for cr, _ in valid_items)
             if abs(total - 1.0) > self._TOTAL_TOLERANCE:
@@ -264,8 +321,10 @@ class LocalMaterialDialog(QDialog):
                 return
             self._update_total_display()
 
-        # Generate a unique material ID
-        mat_id = self._mat_lib.generate_id()
+        # Reuse the existing id when editing so nothing pointing at this
+        # material has to be rewritten, otherwise take a fresh one.
+        mat_id = (self._editing.mat_id if self._editing
+                  else self._mat_lib.generate_id())
 
         if cat == "compound":
             components = []
@@ -280,7 +339,6 @@ class LocalMaterialDialog(QDialog):
                 density=round(self._density_spin.value(), 4),
                 components=components,
             )
-            self._mat_lib.add_compound(mat)
         else:
             components = []
             for cr, sym in valid_items:
@@ -294,6 +352,14 @@ class LocalMaterialDialog(QDialog):
                 density=round(self._density_spin.value(), 4),
                 components=components,
             )
+
+        if self._editing:
+            # In-place: keeps the id and moves the entry if the category
+            # switched underneath the user.
+            self._mat_lib.update_local_material(mat)
+        elif cat == "compound":
+            self._mat_lib.add_compound(mat)
+        else:
             self._mat_lib.add_mixture(mat)
 
         self._last_mat_id = mat_id
