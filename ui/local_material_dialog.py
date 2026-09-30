@@ -11,8 +11,9 @@ Matches cad2gdml style and layout:
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QDoubleSpinBox, QComboBox, QPushButton, QWidget, QGroupBox,
-    QSizePolicy,
+    QSizePolicy, QScrollArea, QFrame,
 )
+from PyQt6.QtCore import Qt, QTimer
 
 from core.materials_lib import (
     MaterialsLib, CompoundMaterial, CompoundItem,
@@ -103,8 +104,16 @@ class LocalMaterialDialog(QDialog):
         self._comp_group = QGroupBox("Composition")
         comp_layout = QVBoxLayout(self._comp_group)
 
+        # Items container
+        self._items_widget = QWidget()
+        self._items_layout = QVBoxLayout(self._items_widget)
+        self._items_layout.setContentsMargins(0, 0, 0, 0)
+        self._items_layout.setSpacing(4)
+
         # Header row: the Ratio label carries the same fixed width as the spin
-        # box below, so the header columns sit over the actual columns.
+        # box below, so the header columns sit over the actual columns. It is
+        # part of the scrolled content on purpose -- outside of it the labels
+        # would shift sideways by the scrollbar width whenever it appears.
         comp_header = QHBoxLayout()
         comp_header.setSpacing(8)
         comp_header.addWidget(QLabel("Element"), 1)
@@ -112,19 +121,24 @@ class LocalMaterialDialog(QDialog):
         ratio_header.setFixedWidth(_RATIO_WIDTH)
         comp_header.addWidget(ratio_header)
         comp_header.addSpacing(8 + _REMOVE_BTN_WIDTH)
-        comp_layout.addLayout(comp_header)
+        self._items_layout.addLayout(comp_header)
 
-        # Items container
-        self._items_widget = QWidget()
-        self._items_layout = QVBoxLayout(self._items_widget)
-        self._items_layout.setContentsMargins(0, 0, 0, 0)
-        self._items_layout.setSpacing(4)
         # The rows are all fixed height, and a box layout with nothing
         # stretchable hands its leftover height to the spacing between items.
         # This trailing spacer absorbs it instead, keeping the rows packed at
         # the top and the Add button at the bottom of the group.
         self._items_layout.addStretch(1)
-        comp_layout.addWidget(self._items_widget, 1)
+
+        # A long element list scrolls here instead of squeezing the rows or
+        # stretching the dialog to the screen height.
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._items_widget)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setMinimumHeight(132)
+        comp_layout.addWidget(self._scroll, 1)
 
         # Total proportion label (for mixture validation feedback)
         total_row = QHBoxLayout()
@@ -219,6 +233,29 @@ class LocalMaterialDialog(QDialog):
         self._items_layout.insertLayout(self._items_layout.count() - 1, row)
         self._rows.append(_CompositionRow(combo, spin))
         self._update_total_display()
+        QTimer.singleShot(0, lambda: self._refresh_scroll_area(reveal_last=True))
+
+    def _refresh_scroll_area(self, reveal_last: bool = False):
+        """Size the scrolled content to its rows and optionally reveal the last.
+
+        Deferred to the next event loop turn, for two reasons:
+
+        * A nested row layout reports its real minimum size only once the layout
+          has been activated; measured any earlier it is a stale 0-ish value.
+        * Qt writes a layout's minimum size back to its widget only for
+          top-level windows, so this child would otherwise keep a minimum of 0
+          and QScrollArea would squeeze a long list into the viewport, letting
+          the rows overlap instead of scrolling.
+
+        A fixed height rather than a minimum one: it shrinks the widget again
+        when rows are removed, and the resize it forces is what updates the
+        scrollbar range.
+        """
+        self._items_widget.setFixedHeight(
+            self._items_widget.minimumSizeHint().height())
+        if reveal_last:
+            bar = self._scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
 
     def _remove_row(self, row_layout: QHBoxLayout):
         """Remove one composition row."""
@@ -240,6 +277,7 @@ class LocalMaterialDialog(QDialog):
         if idx >= 0:
             self._items_layout.takeAt(idx)
         self._update_total_display()
+        QTimer.singleShot(0, self._refresh_scroll_area)
 
     def _update_total_display(self):
         """Update the total proportion label based on current data."""
@@ -381,6 +419,16 @@ class LocalMaterialDialog(QDialog):
         self.setStyleSheet("""
             QDialog {
                 background-color: #ffffff;
+            }
+            /* The composition list must stay on the dialog background: a
+               QScrollArea paints its viewport with the palette Base colour,
+               which is not necessarily white outside of the light theme. */
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: transparent;
             }
             QLabel {
                 color: #2c2c2c;

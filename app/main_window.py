@@ -887,6 +887,13 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             f"Materials: {assigned}/{total} assigned")
 
+    def _log_local_material_gdml(self, gdml: str):
+        """Echo a local material's generated GDML, as cad2gdml does."""
+        self._logger.log_system("━━ GDML Material Definition ━━━━")
+        for line in gdml.strip().splitlines():
+            self._logger.log_system(line)
+        self._logger.log_system("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
     def _on_add_local_material(self):
         """Open local material dialog and auto-select the new material."""
         from core.materials_lib import CustomElement
@@ -900,9 +907,12 @@ class MainWindow(QMainWindow):
                 mat = self._mat_lib.get_local_material_by_id(new_mat_id)
                 if mat:
                     self._property_panel.show_local_material_info(mat)
-            self._logger.log_system(
-                f"Local material added. Total: "
-                f"{len(self._mat_lib.get_local_material_names())}")
+            if self._mat_lib.GDML_OUTPUT_ENABLED and dialog.last_gdml:
+                self._log_local_material_gdml(dialog.last_gdml)
+            else:
+                self._logger.log_system(
+                    f"Local material added. Total: "
+                    f"{len(self._mat_lib.get_local_material_names())}")
 
     def _on_edit_local_material(self, mat_id: str):
         """Re-open a saved local material for editing, in place."""
@@ -927,7 +937,10 @@ class MainWindow(QMainWindow):
         updated = self._mat_lib.get_local_material_by_id(dialog.last_mat_id)
         if updated:
             self._property_panel.show_local_material_info(updated)
-        self._logger.log_system(f"Local material '{mat.mat_name}' updated.")
+        if self._mat_lib.GDML_OUTPUT_ENABLED and dialog.last_gdml:
+            self._log_local_material_gdml(dialog.last_gdml)
+        else:
+            self._logger.log_system(f"Local material '{mat.mat_name}' updated.")
 
     def _on_remove_local_material(self, display_name: str):
         """Remove a local material by tree display name (matches cad2gdml)."""

@@ -397,54 +397,68 @@ class MaterialsLib:
 
     # ========== GDML String Generation ==========
 
-    def to_gdml_string(self, mat_id: str, indent: str = "    ") -> str:
-        """Generate a GDML <material> XML string for a local material by ID."""
-        # Custom element
-        elem = self._custom_elements.get(mat_id)
-        if elem:
-            formula = self._find_formula(elem.atom_weight)
-            return (
-                f'{indent}<material name="{elem.name}">\n'
-                f'{indent}  <D value="{elem.density}" unit="g/cm3"/>\n'
-                f'{indent}  <fraction n="{formula}" ref="{elem.symbol}"/>\n'
-                f'{indent}</material>'
-            )
+    def to_gdml_string(self, mat_id: str) -> str:
+        """GDML <material> XML string for a local material, looked up by ID.
 
-        # Compound
-        comp = self._compounds.get(mat_id)
-        if comp:
-            lines = [
-                f'{indent}<material name="{comp.mat_name}">',
-                f'{indent}  <D value="{comp.density}" unit="g/cm3"/>',
-                f'{indent}  <composite n="1" ref="{comp.components[0].symbol}"/>',
-            ]
-            for c in comp.components[1:]:
-                lines.append(f'{indent}  <composite n="{c.atom_count}" ref="{c.symbol}"/>')
-            lines.append(f'{indent}</material>')
-            return "\n".join(lines)
+        Byte-identical to cad2gdml/core/materials_lib.py, which builds the same
+        string from the material object, so both apps echo the same block in
+        the log for the same material.
+        """
+        import xml.etree.ElementTree as ET
+        from xml.dom import minidom
 
-        # Mixture
-        mix = self._mixtures.get(mat_id)
-        if mix:
-            lines = [
-                f'{indent}<material name="{mix.mat_name}">',
-                f'{indent}  <D value="{mix.density}" unit="g/cm3"/>',
-            ]
-            total = sum(c.mass_fraction for c in mix.components)
-            for c in mix.components:
-                frac = c.mass_fraction / total if total > 0 else 0
-                lines.append(f'{indent}  <fraction n="{frac:.6f}" ref="{c.symbol}"/>')
-            lines.append(f'{indent}</material>')
-            return "\n".join(lines)
+        mat = (self._custom_elements.get(mat_id)
+               or self._compounds.get(mat_id)
+               or self._mixtures.get(mat_id))
+        if mat is None:
+            return ""
+
+        if isinstance(mat, CustomElement):
+            elem = ET.Element("element", {
+                "name": mat.name,
+                "formula": mat.symbol,
+                "Z": str(int(mat.atomic_number)),
+            })
+            ET.SubElement(elem, "atom", {"value": str(mat.atom_weight)})
+            return minidom.parseString(
+                ET.tostring(elem, encoding="unicode")).toprettyxml(indent="  ")
+
+        if isinstance(mat, CompoundMaterial):
+            # Formula in the user's row order, e.g. [H(2), O(1)] -> "H2O"
+            parts = []
+            for item in mat.components:
+                if item.atom_count == 1:
+                    parts.append(item.symbol)
+                else:
+                    parts.append(f"{item.symbol}{int(item.atom_count)}")
+            mat_elem = ET.Element("material", {
+                "name": mat.mat_name,
+                "formula": "".join(parts) if parts else mat.mat_name,
+            })
+            ET.SubElement(mat_elem, "D", {"value": f"{mat.density:.4f}"})
+            for item in mat.components:
+                ET.SubElement(mat_elem, "composite", {
+                    "n": str(int(item.atom_count)),
+                    "ref": item.symbol,
+                })
+            return minidom.parseString(
+                ET.tostring(mat_elem, encoding="unicode")).toprettyxml(indent="  ")
+
+        if isinstance(mat, MixtureMaterial):
+            mat_elem = ET.Element("material", {"name": mat.mat_name})
+            ET.SubElement(mat_elem, "D", {
+                "value": f"{mat.density:.4f}",
+                "unit": "g/cm3",
+            })
+            for item in mat.components:
+                ET.SubElement(mat_elem, "fraction", {
+                    "n": f"{item.mass_fraction:.4f}",
+                    "ref": item.symbol,
+                })
+            return minidom.parseString(
+                ET.tostring(mat_elem, encoding="unicode")).toprettyxml(indent="  ")
 
         return ""
-
-    @staticmethod
-    def _find_formula(atom_weight: float) -> str:
-        """Guess simplified formula based on atomic weight (display only)."""
-        if abs(atom_weight - 1.00794) < 0.01:
-            return "1"
-        return "1.0"
 
     # ========== JSON Serialization ==========
 

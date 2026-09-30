@@ -71,8 +71,10 @@ class ProjectTreeWidget(QWidget):
         self._tree.setAnimated(True)
         self._tree.setIndentation(16)
 
-        # Single bold root entry: "Project Tree" — the total node entrance
-        self._project_root = QTreeWidgetItem(self._tree, ["Project Tree"])
+        # Single bold root entry: the total node entrance. The dock above is
+        # already titled "Project Tree", so this row names the project instead
+        # of repeating that label.
+        self._project_root = QTreeWidgetItem(self._tree, ["Project of GDMLEditor"])
         font = self._project_root.font(0)
         font.setBold(True)
         self._project_root.setFont(0, font)
