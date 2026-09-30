@@ -841,7 +841,7 @@ class MainWindow(QMainWindow):
     def _on_help(self):
         """Show help information"""
         QMessageBox.about(self, "About GDML Editor",
-            "GDML Editor v0.1.0\n\n"
+            "GDML Editor v1.0\n\n"
             "GDML geometry file viewer and editor.\n\n"
             "Supported solid types: box, sphere, tube, cone, tessellated\n"
             "Built with PyQt6 and VTK.\n\n"
