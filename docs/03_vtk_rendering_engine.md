@@ -42,7 +42,7 @@ VtkScene.build_from_tree()
     │   ├── Create vtkPolyDataMapper
     │   └── Create vtkActor
     ├── Apply transform (vtkTransform: Translate + RotateZXY)
-    ├── Set color (material-based or random fallback)
+    ├── Set color (stable palette color derived from node name / entry_id)
     └── vtkRenderer.AddActor(vtkActor)
     ↓
 QVTKRenderWindowInteractor.Render()

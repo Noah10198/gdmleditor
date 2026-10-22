@@ -1,7 +1,6 @@
 # GDML Parser / Writer Capabilities
 
-> Based on analysis against Geant4 official examples under `Ref/gdmlexample/` and `Ref/GDML-Main/SampleFiles/`.
-> Current as of 2026-07-22.
+> Based on analysis against the Geant4 official GDML example geometries.
 
 ---
 

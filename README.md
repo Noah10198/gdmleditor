@@ -2,7 +2,7 @@
 
 **GDML geometry editor** — Import, browse, edit and export Geant4 GDML geometry in an interactive 3D view, with collision checking and scene building.
 
-> **Version 0.1.0** ｜ Last updated 2026-09-30 ｜ Chinese version: [README.zh.md](README.zh.md)
+> **Version 0.1.0** ｜ Chinese version: [README.zh.md](README.zh.md)
 
 ## Overview
 

@@ -35,21 +35,22 @@ Through `AssignMaterialDialog`:
 1. Select target volumes (single/multi/select-all)
 2. Choose material from library
 3. Apply assignment
-4. 3D scene colors update automatically based on material
 
 ## Material Data Flow
 
 ```
 AssignMaterialDialog
     ↓
-MainWindow → GdmlAgent.set_material(volume_node, material_name)
+MainWindow → GdmlAgent.set_material_override(entry_id, material_name)
     ↓
-GdmlNode.material_name (overlay)
-    ↓
-VtkScene.build_from_tree() → assign colors by material
+GdmlAgent._material_overrides (overlay, entry_id → material name)
     ↓
 GdmlWriter.write() → write <materialref> tags
 ```
+
+> **Note**: 3D colors are *not* driven by the material. Each actor gets a stable color
+> derived from the node's `entry_id` / `name` (curated palette, md5-based index), so the
+> color identifies a volume, not its material.
 
 ## Export Strategy
 

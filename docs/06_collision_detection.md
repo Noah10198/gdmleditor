@@ -60,5 +60,3 @@ Generates all unique (i, j) pairs with i < j. O(n²) complexity.
 | Distance info | Overlap depth (ox, oy, oz) | Exact min distance / intersection region |
 | Heatmap | No | Yes (blue=near → red=far) |
 | Use case | Quick filtering of candidates | Exact collision determination |
-
-> Detailed comparison: `cad2gdml/doc/need-check-update.md`

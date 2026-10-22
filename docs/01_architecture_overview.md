@@ -100,14 +100,14 @@ File Export:
 ## Module Dependencies
 
 ```
-main_window.py
-  ├── gdml_agent.py → gdml_parser.py → gdml_tree.py → gdml_evaluator.py
-  │                 → gdml_writer.py
-  │                 → collision_detector.py
-  │                 → materials_lib.py
-  ├── vtk_widget.py → vtk_scene.py → vtk_solid_factory.py
-  ├── project_tree.py
-  ├── property_panel.py
-  ├── interference_panel.py → collision_detector.py
-  └── ribbon_toolbar.py
+app/main_window.py
+  ├── core/gdml_agent.py → core/gdml_parser.py → core/gdml_tree.py → core/gdml_evaluator.py
+  │                     → core/gdml_writer.py
+  │                     → core/collision_detector.py
+  │                     → core/materials_lib.py
+  ├── ui/vtk_widget.py → vtk_engine/vtk_scene.py → vtk_engine/vtk_solid_factory.py
+  ├── ui/project_tree.py
+  ├── ui/property_panel.py
+  ├── ui/interference_panel.py → core/collision_detector.py
+  └── ui/ribbon_toolbar.py
 ```
