@@ -1,4 +1,5 @@
-G4_AIR 
+G4_AIR
+G4_Galactic
 G4_Al
 G4_Si
 G4_H
